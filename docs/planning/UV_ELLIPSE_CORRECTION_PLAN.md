@@ -1,6 +1,6 @@
 # UV Ellipse Correction from Raw Data: Plan
 
-**Status:** Phases 0-3 done (2026-09-24): skeleton; UV cache and `uvcorr build-cache`; ellipse fit and metrics; analysis, `.tec`/CSV export, `uvcorr process`, C++ cross-check and census (see `docs/ALGORITHM.md`). Next: phase 4.
+**Status:** Phases 0-4 done (2026-09-24): skeleton; UV cache and `uvcorr build-cache`; ellipse fit and metrics; analysis, `.tec`/CSV export, `uvcorr process`, C++ cross-check and census (see `docs/ALGORITHM.md`); GUI shell with System Map, Scatter tab and Fit Inspector. Next: phase 5.
 **Repository:** `/home/swuupii/uv-ellipse-correction` (git, branch `main`)
 **Package name:** `uvcorr` (confirmed). Console scripts: `uvcorr` (CLI), `uvcorr-gui`.
 

@@ -58,6 +58,9 @@ def test_cli_process_is_wired(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     assert "not found" in capsys.readouterr().err
 
 
-def test_gui_entry_not_implemented(capsys: pytest.CaptureFixture[str]) -> None:
-    assert gui_main.main() == 1
-    assert "not implemented yet" in capsys.readouterr().err
+def test_gui_entry_is_wired(capsys: pytest.CaptureFixture[str]) -> None:
+    # The window itself (phase 4) is tested in tests/gui/test_main_window.py.
+    with pytest.raises(SystemExit) as excinfo:
+        gui_main.main(["--help"])
+    assert excinfo.value.code == 0
+    assert "uvcorr-gui" in capsys.readouterr().out
