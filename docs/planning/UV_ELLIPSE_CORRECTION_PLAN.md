@@ -1,6 +1,6 @@
 # UV Ellipse Correction from Raw Data: Plan
 
-**Status:** Phase 0 done (2026-09-24): repo, venv, skeleton and tooling. Next: phases 1-2.
+**Status:** Phases 0-1 done (2026-09-24): skeleton; channels, UV cache and `uvcorr build-cache`. Next: phase 2.
 **Repository:** `/home/swuupii/uv-ellipse-correction` (git, branch `main`)
 **Package name:** `uvcorr` (confirmed). Console scripts: `uvcorr` (CLI), `uvcorr-gui`.
 
@@ -360,6 +360,8 @@ the overrides. The widgets talk only to that layer.
    active channels. The totals measured on 2026-09-24 were 208,492,906 events, 224,956 of them on inactive
    channels, so 208,267,950 active is expected (verify; node 0 or other anomalies would shift this). A
    synthetic `.dat` file round-trips exactly. A stale cache is detected when the size or mtime changes.
+   - **Result (phase 1, 2026-09-24):** 208,267,950 kept and 224,956 inactive (R0 ch 1-3, R1 ch 6), 0 on
+     node 0, confirmed by an independent re-parse that also matched all 155 boards event for event.
 2. **Synthetic ellipses:**
    - Known cx, cy, a, b, φ (including φ near ±π/2 and near-circles with b/a > 0.99), with Gaussian radial
      noise and 0-10 % injected uniform outliers. The recovered parameters match within tolerance, and the
@@ -390,10 +392,11 @@ the overrides. The widgets talk only to that layer.
 |----------|-------|
 | Size / parse time | 3,478,589,791 B / 15.8 s (`iter_event_arrays(batch_events=2_000_000)`) |
 | Frames / events / dropped | 106,063,959 / 208,492,906 / 23 |
-| Nodes / boards | 1-10 / 15-30 |
+| Nodes / boards | 1-10 / 15-30; **155 boards with data** (not 160). No events on (node, board) (2,18), (6,24), (7,15), (8,22), (9,20); 1-5 events on (8,16), (8,21), (9,18), (7,20), (4,20), (6,20). Median board 1.08M events, max (3,25) 5.31M |
 | Channels with data | 6,609: 6,557 active, 52 inactive (R0 ch 1-3, R1 ch 6, 224,956 events) |
 | Events per channel | min 1, p5 29, p10 451, median 17,646, p90 51,550, max 946,025; 442 active channels have < 100 |
 | U / V (5M-event sample) | U 1266-3187, V 1312-2752, median about 2043 for both; no U = V = 0 (AND mode) |
+| UV cache (phase 1) | lzf + shuffle, 65,536-event chunks: build 22-23 s wall (parse alone ≈ 11-12 s on this run), peak RSS ≈ 0.9 GB, **1.26 GB** on disk (1.67 GB uncompressed). Alternatives measured: none 15.8 s / 1.71 GB, gzip-1 + shuffle 35 s / 0.98 GB (≈1.5× slower reads). Reuse check 1.4 ms; `load_board` 16-25 ms for a median board, ≈ 0.1 s for the largest |
 
 The `EventBatch` columns (from `adc2kev.parser.measurement_event`) are:
 - `trigger_num` int64, `node_num` uint8, `board_num` uint8, `rena_num` uint8, `channel_num` uint8

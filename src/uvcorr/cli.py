@@ -3,13 +3,19 @@
 Subcommands (plan section 8):
 
 ``uvcorr build-cache data.dat [--cache PATH] [--force]``
-    Build (or reuse) the sibling HDF5 UV cache for a raw ``.dat`` file. Phase 1.
+    Build (or reuse) the sibling HDF5 UV cache for a raw ``.dat`` file.
 
 ``uvcorr process data.dat --output-dir out/ [...]``
     Fit every active channel and write ``<stem>.tec`` and ``radial_summary.csv``.
-    Phase 3.
+    Not implemented yet (phase 3); exits with status 1.
 
-Both subcommands are registered but not implemented yet; they exit with status 1.
+Exit codes: 0 on success, 1 on an error (e.g. a failed build, an unusable
+cache path, a cache in use by another process, or too little disk space), 2
+for a missing input file or bad arguments, 130 when the build was stopped with
+Ctrl-C. Ctrl-C during a build sets the build's stop flag: the build stops at
+its next check (within one parser batch), removes its temporary file and
+leaves any previous cache untouched; further Ctrl-Cs are ignored until that
+cleanup has finished.
 """
 
 from __future__ import annotations
@@ -17,14 +23,32 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import signal
 import sys
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from types import FrameType
+from typing import Any, TextIO
 
 from uvcorr import __version__
+from uvcorr.cache import (
+    USER_WARNING,
+    CacheBuildCancelled,
+    UVCache,
+    UVCacheError,
+    default_cache_path,
+)
 
 logger = logging.getLogger(__name__)
 
+EXIT_OK = 0
+EXIT_ERROR = 1
 EXIT_NOT_IMPLEMENTED = 1
+EXIT_USAGE = 2
+EXIT_INTERRUPTED = 130
 
 
 def _positive_int(value: str) -> int:
@@ -75,7 +99,7 @@ def _add_build_cache_parser(
     """Register the ``build-cache`` subcommand."""
     p = subparsers.add_parser(
         "build-cache",
-        help="Build the HDF5 UV cache for a raw .dat file (not implemented yet).",
+        help="Build (or reuse) the HDF5 UV cache for a raw .dat file.",
         description="Build (or reuse) the sibling HDF5 UV cache for a raw .dat file.",
     )
     p.add_argument("dat", type=Path, help="Raw .dat acquisition file.")
@@ -140,9 +164,186 @@ def _not_implemented(command: str, phase: int) -> int:
     return EXIT_NOT_IMPLEMENTED
 
 
+class _ProgressPrinter:
+    """Throttled progress callback that writes to a stream (stderr).
+
+    On a terminal the line is redrawn in place at every whole percent; on a
+    pipe or file a new line is written every 10 %.
+    """
+
+    def __init__(self, label: str, stream: TextIO | None = None) -> None:
+        self._label = label
+        self._stream = stream if stream is not None else sys.stderr
+        self._tty = bool(getattr(self._stream, "isatty", lambda: False)())
+        self._step = 1 if self._tty else 10
+        self._last = -1
+        self._t0 = time.perf_counter()
+
+    def __call__(self, fraction: float) -> None:
+        pct = max(0, min(100, int(fraction * 100)))
+        bucket = pct // self._step
+        if bucket == self._last:
+            return
+        self._last = bucket
+        elapsed = time.perf_counter() - self._t0
+        text = f"{self._label}: {pct:3d}% ({elapsed:5.1f} s)"
+        if self._tty:
+            print(f"\r{text}", end="", file=self._stream, flush=True)
+        else:
+            print(text, file=self._stream, flush=True)
+
+    def close(self) -> None:
+        """End the in-place progress line (terminal only)."""
+        if self._tty and self._last >= 0:
+            print(file=self._stream, flush=True)
+
+
+@contextmanager
+def _sigint_sets(stop: threading.Event) -> Iterator[None]:
+    """While active, Ctrl-C sets ``stop`` instead of raising KeyboardInterrupt.
+
+    The previous handler is restored only when the block exits, i.e. after
+    the build has stopped and cleaned up, so no KeyboardInterrupt can land in
+    the middle of that cleanup. Only installed in the main thread
+    (``signal.signal`` fails elsewhere).
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(_signum: int, _frame: FrameType | None) -> None:
+        if stop.is_set():
+            print("\nstill stopping the build...", file=sys.stderr, flush=True)
+            return
+        stop.set()
+        print("\nstopping the build...", file=sys.stderr, flush=True)
+
+    previous = signal.signal(signal.SIGINT, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+class _DropUserWarnings(logging.Filter):
+    """Drop the cache's end-user warnings, which the CLI prints itself."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, USER_WARNING, False)
+
+
+@contextmanager
+def _cli_reports_user_warnings() -> Iterator[None]:
+    cache_logger = logging.getLogger("uvcorr.cache")
+    drop = _DropUserWarnings()
+    cache_logger.addFilter(drop)
+    try:
+        yield
+    finally:
+        cache_logger.removeFilter(drop)
+
+
+def _format_bytes(n_bytes: int) -> str:
+    return f"{n_bytes / 1e9:.2f} GB" if n_bytes >= 1e8 else f"{n_bytes / 1e6:.2f} MB"
+
+
+def _print_cache_summary(
+    cache: UVCache, meta: dict[str, Any], reused: bool, elapsed: float
+) -> None:
+    """Print the build-cache summary to stdout."""
+    counts = cache.board_event_counts()
+    nodes = sorted({node for node, _ in counts})
+    boards = sorted({board for _, board in counts})
+    kept = int(meta["n_events_kept"])
+    inactive = int(meta["n_events_inactive"])
+    node0 = int(meta.get("n_events_node0", 0))
+    uv_zero = meta.get("n_events_uv_zero")  # absent in caches built before it existed
+    if reused:
+        status = f"reused (valid for the .dat; built {meta.get('created_at', '?')})"
+    else:
+        status = f"built in {float(meta['build_seconds']):.1f} s"
+    board_range = f"nodes {_ranges(nodes)}, boards {_ranges(boards)}" if counts else "none"
+    print(f"UV cache: {cache.path}")
+    print(f"  status:        {status}")
+    print(f"  events kept:   {kept:,} on {len(counts)} boards ({board_range})")
+    if uv_zero:
+        print(f"                 {int(uv_zero):,} of them with U = V = 0")
+    print(f"  dropped:       {inactive:,} on inactive channels, {node0:,} from node 0")
+    print(
+        f"  parser:        {int(meta['parser_frames']):,} frames, "
+        f"{int(meta['parser_events']):,} events, {int(meta['parser_dropped']):,} dropped frames"
+    )
+    print(f"  cache size:    {_format_bytes(cache.path.stat().st_size)}")
+    print(f"  time:          {elapsed:.1f} s")
+
+
+def _ranges(values: list[int]) -> str:
+    """Compact ``1-10`` / ``1,3,5-7`` rendering of sorted integers."""
+    parts: list[str] = []
+    start = prev = values[0]
+    for value in [*values[1:], None]:
+        if value is not None and value == prev + 1:
+            prev = value
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        if value is not None:
+            start = prev = value
+    return ",".join(parts)
+
+
 def _run_build_cache(args: argparse.Namespace) -> int:
-    """Run ``uvcorr build-cache`` (phase 1)."""
-    return _not_implemented(args.command, phase=1)
+    """Run ``uvcorr build-cache``: build or reuse the UV cache, print a summary."""
+    dat: Path = args.dat
+    if not dat.is_file():
+        print(f"error: raw data file not found: {dat}", file=sys.stderr)
+        return EXIT_USAGE
+    cache = UVCache(args.cache if args.cache is not None else default_cache_path(dat))
+
+    t0 = time.perf_counter()
+    try:
+        with _cli_reports_user_warnings():
+            reused = not args.force and cache.is_valid_for(dat)
+            if not reused:
+                _build_with_progress(cache, dat, force=args.force)
+            meta = cache.metadata()
+            _print_cache_summary(cache, meta, reused, time.perf_counter() - t0)
+    except CacheBuildCancelled:
+        print("build cancelled; no new cache was written.", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    except (UVCacheError, OSError) as exc:  # build errors, busy cache, disk space
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    if int(meta.get("parser_frames", 0)) == 0 and int(meta.get("source_size", 0)) > 0:
+        print(
+            f"warning: no valid frames in {dat}: is this a raw .dat file?",
+            file=sys.stderr,
+        )
+    return EXIT_OK
+
+
+def _build_with_progress(cache: UVCache, dat: Path, *, force: bool) -> None:
+    """Build ``cache`` from ``dat`` with stderr progress and Ctrl-C as stop flag."""
+    if force:
+        reason = "--force"
+    elif cache.exists():
+        reason = "existing file is not a valid cache for this .dat"
+    else:
+        reason = "no cache yet"
+    print(f"Building UV cache {cache.path} ({reason})", file=sys.stderr)
+    if cache.has_results():
+        print(
+            f"warning: {cache.path} stores analysis results/overrides (/results); "
+            "rebuilding the cache discards them",
+            file=sys.stderr,
+        )
+    stop = threading.Event()
+    progress = _ProgressPrinter("parsing", sys.stderr)
+    try:
+        with _sigint_sets(stop):
+            cache.build_from_dat(dat, progress_cb=progress, stop_flag=stop)
+    finally:
+        progress.close()
 
 
 def _run_process(args: argparse.Namespace) -> int:
@@ -167,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
         return exit_code
     except KeyboardInterrupt:
         print("\ninterrupted.", file=sys.stderr)
-        return 130
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":

@@ -49,17 +49,9 @@ def test_cli_requires_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
     assert "required" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["build-cache", "data.dat"],
-        ["process", "data.dat", "--output-dir", "out"],
-    ],
-)
-def test_cli_subcommands_not_implemented(
-    argv: list[str], capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert cli.main(argv) == cli.EXIT_NOT_IMPLEMENTED
+def test_cli_process_not_implemented(capsys: pytest.CaptureFixture[str]) -> None:
+    # build-cache is implemented since phase 1 (tests/test_cli.py).
+    assert cli.main(["process", "data.dat", "--output-dir", "out"]) == cli.EXIT_NOT_IMPLEMENTED
     assert "not implemented yet" in capsys.readouterr().err
 
 
