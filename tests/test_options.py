@@ -253,3 +253,54 @@ class TestFitOptionsJson:
         assert FitOptions.from_dict({"max_iter": 3}) == FitOptions(max_iter=3)
         with pytest.raises(TypeError):
             FitOptions.from_dict([("max_iter", 3)])  # type: ignore[arg-type]
+
+
+class TestEffectiveOptions:
+    """``effective_options`` / ``same_fit``: the rule shared by the CLI and the GUI."""
+
+    def test_robust_options_are_returned_as_they_are(self) -> None:
+        robust = FitOptions(clip_k=3.0, max_iter=9, min_events=50)
+        assert options.effective_options(robust) is robust
+
+    def test_robust_only_fields_are_reset_without_robust(self) -> None:
+        odd = FitOptions(robust=False, clip_k=3.0, max_iter=9, min_events=50, geometric=True)
+        effective = options.effective_options(odd)
+        assert effective == FitOptions(robust=False, min_events=50, geometric=True)
+        assert effective.clip_k == DEFAULTS["clip_k"] and effective.max_iter == DEFAULTS["max_iter"]
+        assert {"clip_k", "max_iter"} == options.ROBUST_ONLY_FIELDS
+        # Every other field is kept
+        changed = {
+            name for name, value in odd.to_dict().items() if effective.to_dict()[name] != value
+        }
+        assert changed == options.ROBUST_ONLY_FIELDS
+
+    def test_is_idempotent(self) -> None:
+        for opts in (FitOptions(), FitOptions(robust=False, clip_k=2.5), FitOptions(max_iter=2)):
+            once = options.effective_options(opts)
+            assert options.effective_options(once) == once
+
+    @pytest.mark.parametrize(
+        ("left", "right", "same"),
+        [
+            (FitOptions(), FitOptions(), True),
+            (FitOptions(robust=False), FitOptions(robust=False, clip_k=3.0, max_iter=9), True),
+            (FitOptions(robust=False, clip_k=3.0), FitOptions(robust=False, max_iter=2), True),
+            (FitOptions(clip_k=3.0), FitOptions(), False),  # robust on: clip k matters
+            (FitOptions(max_iter=2), FitOptions(), False),
+            (FitOptions(robust=False), FitOptions(), False),
+            (FitOptions(robust=False, clip_k=3.0), FitOptions(clip_k=3.0), False),
+            (FitOptions(robust=False), FitOptions(robust=False, min_events=50), False),
+            (FitOptions(robust=False), FitOptions(robust=False, geometric=True), False),
+            (FitOptions(robust=False), FitOptions(robust=False, broad_ring_frac=0.1), False),
+        ],
+    )
+    def test_same_fit(self, left: FitOptions, right: FitOptions, same: bool) -> None:
+        assert options.same_fit(left, right) is same
+        assert options.same_fit(right, left) is same  # symmetric
+
+    def test_gui_session_reexports_the_same_functions(self) -> None:
+        pytest.importorskip("PyQt6")
+        from uvcorr.gui import session
+
+        assert session.effective_options is options.effective_options
+        assert session.same_fit is options.same_fit

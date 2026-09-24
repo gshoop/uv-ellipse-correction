@@ -47,7 +47,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--workers",
         type=int,
         default=None,
-        help="worker processes for Fit All (default: min(8, CPU count))",
+        help="worker processes for Fit All (default: min(8, usable CPUs))",
     )
     parser.add_argument(
         "-v",

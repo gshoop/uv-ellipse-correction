@@ -719,12 +719,14 @@ def default_workers() -> int:
     Usable CPUs are ``len(os.sched_getaffinity(0))`` where available (it
     honours ``taskset``/cgroup CPU sets), else ``os.cpu_count()``.
 
-    Measured on the full test acquisition (208M events, 155 boards, 24 cores,
-    2026-09-24): 1/4/8/12/16 workers took about 114/33/16/12.5/11 s with a peak
-    PSS of the whole process tree of 0.5/1.1/1.9/2.5/3.1 GB (~0.17 GB per
-    worker: the scientific libraries, one board's arrays and the per-channel
-    float64 temporaries). 8 keeps the run far below the 2-minute target at a
-    moderate memory cost.
+    Measured with :func:`analyze_all` (default options) on the full test
+    acquisition (208M events, 155 boards; 24 cores, WSL2) on 2026-09-24, one
+    fresh process per run, the cache file in the page cache and no other jobs
+    on the machine (load average 0.6 before the runs): 1/4/8/12/16 workers
+    took 109/29/16/12/11 s with a peak PSS of the whole process tree of
+    0.5/1.1/1.8/2.4/3.0 GB (~0.17 GB per worker: the scientific libraries,
+    one board's arrays and the per-channel float64 temporaries). 8 keeps the
+    run far below the 2-minute target at a moderate memory cost.
     """
     try:
         cpus = len(os.sched_getaffinity(0))

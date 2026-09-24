@@ -368,6 +368,21 @@ def test_unreadable_results_open_with_a_warning(
     assert window.session.has_results and dialogs.errors == []
 
 
+def test_open_dialog_filters_match_is_cache_file() -> None:
+    from uvcorr.gui import window as window_module
+    from uvcorr.gui.session import is_cache_file
+
+    def patterns(name_filter: str) -> set[str]:
+        return set(name_filter[name_filter.index("(") + 1 : name_filter.index(")")].split())
+
+    cache_patterns = patterns(window_module._CACHE_FILTER.split(";;")[0])
+    assert cache_patterns == {"*.uv.h5", "*.h5", "*.hdf5"}
+    assert all(is_cache_file("run" + pattern[1:]) for pattern in cache_patterns)
+    any_filters = window_module._ANY_FILTER.split(";;")
+    assert patterns(any_filters[0]) == cache_patterns | {"*.dat"}
+    assert patterns(any_filters[2]) == cache_patterns
+
+
 def test_open_raw_routes_caches_and_refuses_non_raw_files(
     make_window: MakeWindow,
     qtbot: QtBot,

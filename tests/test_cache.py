@@ -45,7 +45,7 @@ from uvcorr.cache import (
     open_or_build,
 )
 from uvcorr.channels import active_channel_mask
-from uvcorr.options import FitOptions
+from uvcorr.options import FitOptions, same_fit
 
 # Small thresholds so a ~12k-event file goes through many batches and every
 # flushing path (global budget, per-board limit, partial chunks).
@@ -320,16 +320,15 @@ class TestBuild:
         assert uv.exists() and uv.is_valid_for(synthetic_file.path)
         assert not default_cache_path(synthetic_file.path).exists()
 
-    def test_empty_file(self, tmp_path: Path) -> None:
+    def test_empty_file_is_refused(self, tmp_path: Path) -> None:
+        # A 0-byte file has no frame: no cache (see also TestFilesWithoutFrames)
         dat = tmp_path / "empty.dat"
         dat.write_bytes(b"")
         uv = UVCache(default_cache_path(dat))
         progress: list[float] = []
-        stats = uv.build_from_dat(dat, progress_cb=progress.append)
-        assert stats.n_events_parsed == stats.n_boards == 0
-        assert uv.boards() == []
-        assert uv.is_valid_for(dat)
-        assert progress == [1.0]
+        with pytest.raises(CacheBuildError, match="no valid frames"):
+            uv.build_from_dat(dat, progress_cb=progress.append)
+        assert progress == [] and not uv.exists() and uv.tmp_files() == []
 
     def test_node0_and_inactive_only(self, tmp_path: Path) -> None:
         frames = [
@@ -579,6 +578,17 @@ class TestValidity:
             f.write(b"\x00")
         os.utime(synthetic_file.path, ns=(st.st_atime_ns, st.st_mtime_ns))
         assert not built.is_valid_for(synthetic_file.path)
+
+    def test_cache_without_frames_is_never_valid(
+        self, built: UVCache, synthetic_file: SyntheticFile
+    ) -> None:
+        # What an earlier uvcorr wrote for a file without valid frames
+        with h5py.File(built.path, "a") as h5f:
+            h5f["metadata"].attrs["parser_frames"] = np.int64(0)
+        assert not built.is_valid_for(synthetic_file.path)
+        with h5py.File(built.path, "a") as h5f:  # an old cache without the attribute is fine
+            del h5f["metadata"].attrs["parser_frames"]
+        assert built.is_valid_for(synthetic_file.path)
 
     def test_mtime_change(self, built: UVCache, synthetic_file: SyntheticFile) -> None:
         st = synthetic_file.path.stat()
@@ -1014,14 +1024,57 @@ class TestUserWarnings:
             open_or_build(synthetic_file.path, force=True)
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
-    def test_file_without_frames(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+
+class TestFilesWithoutFrames:
+    """A source file without any valid frame is an error: nothing is left behind."""
+
+    @pytest.mark.parametrize(
+        "content",
+        [b"not a raw acquisition\n" * 100, bytes(range(256)) * 64, b""],
+        ids=["text", "binary", "empty"],
+    )
+    def test_is_a_build_error(self, tmp_path: Path, content: bytes) -> None:
         dat = tmp_path / "notes.dat"
-        dat.write_bytes(b"not a raw acquisition\n" * 100)
+        dat.write_bytes(content)
+        uv = UVCache(default_cache_path(dat))
+        progress: list[float] = []
+        with pytest.raises(CacheBuildError) as info:
+            uv.build_from_dat(dat, progress_cb=progress.append)
+        assert str(info.value) == f"no valid frames in {dat}: is this a raw .dat file?"
+        assert 1.0 not in progress  # never reported as done
+        assert uv.last_build is None
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.dat"]  # no cache, no tmp
+        with pytest.raises(CacheBuildError, match="no valid frames"):
+            open_or_build(dat)
+        assert not uv.exists() and uv.tmp_files() == []
+
+    def test_previous_cache_is_left_untouched(self, built: UVCache, tmp_path: Path) -> None:
+        built.save_results(BATCH, FitOptions())
+        before = hashlib.sha256(built.path.read_bytes()).hexdigest()
+        junk = tmp_path / "junk.dat"
+        junk.write_bytes(b"\xff" * 10_000)
+        with pytest.raises(CacheBuildError, match="no valid frames"):
+            built.build_from_dat(junk)
+        assert hashlib.sha256(built.path.read_bytes()).hexdigest() == before
+        assert built.tmp_files() == []
+        stored = built.load_results()
+        assert stored is not None and len(stored.results) == len(BATCH)
+
+    def test_frames_on_inactive_channels_give_a_valid_empty_cache(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        frames = [
+            Frame(1, 15, 0, 1, (Hit(2, 1, 5, 5),)),  # RENA 0 channel 2: inactive
+            Frame(0, 16, 0, 2, (Hit(10, 1, 5, 5),)),  # node 0: dropped
+        ]
+        dat = write_dat(tmp_path / "inactive.dat", frames)
         with caplog.at_level(logging.WARNING, logger="uvcorr.cache"):
-            stats = open_or_build(dat).last_build
-        assert stats is not None and stats.parser_frames == stats.n_events_parsed == 0
-        records = [r for r in caplog.records if "No valid frames" in r.getMessage()]
-        assert len(records) == 1 and getattr(records[0], cache.USER_WARNING) is True
+            uv = open_or_build(dat)
+        stats = uv.last_build
+        assert stats is not None and stats.parser_frames == 2 and stats.n_events_kept == 0
+        assert stats.n_events_inactive == 1 and stats.n_events_node0 == 1
+        assert uv.is_valid_for(dat) and uv.board_event_counts() == {}
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 class TestBuildChecks:
@@ -1604,6 +1657,58 @@ class TestReplaceOverrides:
         current = built.results_created_at()
         assert built.clear_overrides(expected_created_at=current) == 1
 
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda uv, expected: uv.replace_overrides(expected_created_at=expected),
+            lambda uv, expected: uv.save_overrides([], REFIT, expected_created_at=expected),
+            lambda uv, expected: uv.delete_overrides([], expected_created_at=expected),
+        ],
+        ids=["replace", "save", "delete"],
+    )
+    def test_stale_results_are_refused_with_nothing_to_write(
+        self, built: UVCache, call: Callable[[UVCache, str | None], Any]
+    ) -> None:
+        """The check runs even when there is nothing to save or delete (read-only)."""
+        built.save_results(BATCH, FitOptions())
+        loaded = built.load_results()
+        assert loaded is not None
+        assert call(built, loaded.created_at) in ((0, 0), 0)  # current: nothing to do
+        built.save_results(BATCH, FitOptions(clip_k=3.0))  # another process replaces them
+        before_bytes = built.path.read_bytes()
+        with pytest.raises(StaleResultsError, match="replaced"):
+            call(built, loaded.created_at)
+        assert built.path.read_bytes() == before_bytes  # opened read-only
+        assert call(built, None) in ((0, 0), 0)  # no expectation: no check
+        with h5py.File(built.path, "r+") as h5f:
+            del h5f["results"]
+        with pytest.raises(StaleResultsError, match="removed"):
+            call(built, loaded.created_at)
+
+    def test_nothing_to_write_without_expectation_does_not_open_the_file(
+        self, built: UVCache, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built.save_results(BATCH, FitOptions())
+        stored = built.load_results()
+        assert stored is not None
+        opened: list[str] = []
+        real_open = cache._open_h5
+
+        def spy(path: Path, mode: str = "r") -> Any:
+            opened.append(mode)
+            return real_open(path, mode)
+
+        monkeypatch.setattr(cache, "_open_h5", spy)
+        assert built.replace_overrides() == (0, 0) and opened == []
+        assert built.replace_overrides(expected_created_at=stored.created_at) == (0, 0)
+        assert opened == ["r"]  # the check opens read-only
+
+    def test_nothing_to_write_on_a_missing_file(self, tmp_path: Path) -> None:
+        missing = UVCache(tmp_path / "gone.uv.h5")
+        assert missing.replace_overrides() == (0, 0)
+        with pytest.raises(StaleResultsError, match="removed"):
+            missing.replace_overrides(expected_created_at="2026-09-24T10:46:00")
+
     def test_removed_results_are_stale_too(self, built: UVCache, tmp_path: Path) -> None:
         built.save_results(BATCH, FitOptions())
         stored = built.load_results()
@@ -1682,3 +1787,119 @@ class TestDropOverridesOnSave:
         assert built.load_results() == before
         with h5py.File(built.path, "r") as h5f:
             assert set(h5f["results"]) == {"current"}
+
+
+def _stored_override_table(uv: UVCache) -> np.ndarray:
+    with h5py.File(uv.path, "r") as h5f:
+        return h5f["results/current/overrides/table"][()]
+
+
+def _rewrite_override_table(uv: UVCache, table: np.ndarray) -> np.ndarray:
+    """Replace the overrides table; returns it as read back (strings as stored)."""
+    with h5py.File(uv.path, "r+") as h5f:
+        del h5f["results/current/overrides/table"]
+        h5f.create_dataset("results/current/overrides/table", data=table)
+    return _stored_override_table(uv)
+
+
+def _row_of(table: np.ndarray, key: ChannelKey) -> int:
+    names = ("node", "board", "rena", "channel")
+    rows = [i for i in range(len(table)) if tuple(int(table[n][i]) for n in names) == key]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def _as_newer_table(table: np.ndarray) -> np.ndarray:
+    """``table`` as a newer uvcorr might write it: with an extra column."""
+    fields = [(n, table.dtype[n]) for n in table.dtype.names] + [("future_metric", np.float64)]
+    newer = np.zeros(len(table), dtype=fields)
+    for name in table.dtype.names:
+        newer[name] = table[name]
+    newer["future_metric"] = np.arange(len(table), dtype=np.float64) + 0.5
+    return newer
+
+
+def _same_table(a: np.ndarray, b: np.ndarray) -> bool:
+    """Same dtype and values, field by field (NaN equals NaN)."""
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    for name in a.dtype.names:
+        if a.dtype[name].kind == "f":
+            if not np.array_equal(a[name], b[name], equal_nan=True):
+                return False
+        elif a[name].tolist() != b[name].tolist():
+            return False
+    return True
+
+
+class TestOverridesOfANewerVersion:
+    """The drop path keeps what it cannot read: verbatim rows, and unknown options."""
+
+    def _setup(self, built: UVCache) -> np.ndarray:
+        """Overrides robust off (BATCH[0]), clip k 3 (BATCH[1]) and geometric (BATCH[2], with
+        a status this version does not know), in a table with an extra column."""
+        built.save_results(BATCH, FitOptions())
+        built.save_overrides(BATCH[:1], FitOptions(robust=False))
+        built.save_overrides(BATCH[1:2], FitOptions(clip_k=3.0))
+        built.save_overrides(BATCH[2:3], FitOptions(geometric=True))
+        newer = _as_newer_table(_stored_override_table(built))
+        newer["status"][_row_of(newer, BATCH[2].key)] = "future_status"
+        newer = _rewrite_override_table(built, newer)
+        stored = built.load_results()
+        assert stored is not None  # the future row is skipped
+        assert sorted(stored.overrides) == sorted([BATCH[0].key, BATCH[1].key])
+        return newer
+
+    def test_nothing_dropped_copies_the_table_verbatim(self, built: UVCache) -> None:
+        newer = self._setup(built)
+        n = built.save_results(
+            BATCH, FitOptions(min_events=50), drop_overrides=lambda _k, _o: False
+        )
+        assert n == 0
+        assert _same_table(_stored_override_table(built), newer)  # extra column, future row
+
+    def test_dropping_some_keeps_the_rest_verbatim(self, built: UVCache) -> None:
+        newer = self._setup(built)
+        batch = FitOptions(robust=False, clip_k=2.0)  # fits like the robust-off override
+        n = built.save_results(BATCH, batch, drop_overrides=lambda _k, used: same_fit(used, batch))
+        assert n == 1
+        table = _stored_override_table(built)
+        keep = np.ones(len(newer), dtype=bool)
+        keep[_row_of(newer, BATCH[0].key)] = False
+        assert _same_table(table, newer[keep])  # the future row and column survive
+        stored = built.load_results()
+        assert stored is not None and list(stored.overrides) == [BATCH[1].key]
+
+    def test_an_undecodable_row_is_never_offered_to_the_predicate(self, built: UVCache) -> None:
+        newer = self._setup(built)
+        seen: list[tuple[int, ...]] = []
+
+        def drop_all(key: ChannelKey, _options: FitOptions) -> bool:
+            seen.append(tuple(key))
+            return True
+
+        assert built.save_results(BATCH, FitOptions(), drop_overrides=drop_all) == 2
+        assert sorted(seen) == sorted(tuple(r.key) for r in BATCH[:2])
+        assert _same_table(_stored_override_table(built), newer[[_row_of(newer, BATCH[2].key)]])
+
+    def test_unknown_option_keys_are_never_dropped(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_overrides(BATCH[:2], FitOptions(robust=False))
+        table = _stored_override_table(built)
+        data = FitOptions(robust=False).to_dict() | {"future_option": 7}
+        table["options_json"][0] = json.dumps(data)
+        table = _rewrite_override_table(built, table)
+        stored = built.load_results()
+        assert stored is not None
+        first, second = (stored.overrides[key] for key in sorted(stored.overrides))
+        assert first.options == second.options == FitOptions(robust=False)  # parsed leniently
+        assert first.unknown_options == ("future_option",) and second.unknown_options == ()
+        batch = FitOptions(robust=False)
+        assert not first.reproduced_by(batch) and second.reproduced_by(batch)
+        assert not second.reproduced_by(FitOptions())
+        n = built.save_results(BATCH, batch, drop_overrides=lambda _k, used: same_fit(used, batch))
+        assert n == 1
+        kept = _stored_override_table(built)
+        assert _same_table(kept, table[:1])  # the future options JSON is kept as written
+        stored = built.load_results()
+        assert stored is not None and list(stored.overrides) == [first.result.key]

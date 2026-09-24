@@ -13,6 +13,12 @@ the algebraic fit was kept).
 
 The status and flag strings below are the single source of truth for the
 ``status`` and ``flags`` CSV columns (plan 5.1 and 6.2).
+
+:func:`effective_options` and :func:`same_fit` tell whether two option sets
+fit identically (with ``robust`` off, ``clip_k`` and ``max_iter`` do not
+matter). ``uvcorr process`` and the GUI's Fit All use them to drop the stored
+overrides a new batch reproduces, and the GUI to decide between storing a
+re-fit as an override and reverting to the batch.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ import logging
 import math
 import numbers
 from collections.abc import Iterable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 import numpy as np
@@ -296,3 +302,59 @@ class FitOptions:
         if not isinstance(data, dict):
             raise ValueError("FitOptions JSON must be an object")
         return cls.from_dict(data, strict=strict)
+
+
+ROBUST_ONLY_FIELDS: frozenset[str] = frozenset({"clip_k", "max_iter"})
+"""``FitOptions`` fields that only the robust iteration uses (ignored when ``robust`` is off)."""
+
+
+def effective_options(options: FitOptions) -> FitOptions:
+    """Return the options as the fit uses them.
+
+    Without the robust iteration, ``clip_k`` and ``max_iter`` have no effect
+    (:func:`uvcorr.ellipse.fit_ellipse` never reads them), so they are reset to
+    their defaults. Two option sets therefore fit identically exactly when
+    their effective options are equal (:func:`same_fit`). The CLI and the GUI
+    use this to decide whether a stored override is reproduced by a new batch
+    (and is dropped), and the GUI to choose between storing an override and
+    reverting to the batch.
+
+    Args:
+        options: Any fit options.
+
+    Returns:
+        ``options`` itself when ``robust`` is on; otherwise a copy with
+        ``clip_k`` and ``max_iter`` at their defaults.
+
+    Example:
+        >>> effective_options(FitOptions(robust=False, clip_k=3.0)) == FitOptions(robust=False)
+        True
+        >>> effective_options(FitOptions(clip_k=3.0)).clip_k
+        3.0
+    """
+    if options.robust:
+        return options
+    defaults = FitOptions()
+    return replace(options, clip_k=defaults.clip_k, max_iter=defaults.max_iter)
+
+
+def same_fit(options: FitOptions, other: FitOptions) -> bool:
+    """Return whether two option sets fit every channel identically.
+
+    Compares :func:`effective_options`: with ``robust`` off on both sides,
+    ``clip_k`` and ``max_iter`` do not matter; every other field must be equal.
+
+    Args:
+        options: One option set.
+        other: The other option set.
+
+    Returns:
+        True if the effective options are equal.
+
+    Example:
+        >>> same_fit(FitOptions(robust=False, max_iter=9), FitOptions(robust=False))
+        True
+        >>> same_fit(FitOptions(clip_k=3.0), FitOptions())
+        False
+    """
+    return effective_options(options) == effective_options(other)

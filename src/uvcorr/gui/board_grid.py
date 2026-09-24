@@ -21,8 +21,9 @@ A *before/after* toggle switches every cell between
 
 One bad fit must not squash the other 46 rings, so the windows leave out
 fits flagged ``extreme_axis_ratio`` and fits whose centre is far from the
-other fits on the same RENA (:func:`window_fits`). Those channels are still
-drawn (possibly clipped); the info line names the clipped ones.
+median centre of the fits on the same RENA (:func:`window_fits`). Those
+channels are still drawn (possibly clipped); the info line names the clipped
+ones.
 
 Channels without an ellipse (``too_few_events``, ``fit_failed``, not fitted)
 show their raw points without an overlay: in the after view centred on their
@@ -452,10 +453,10 @@ def window_fits(cells: Collection[GridCell]) -> tuple[list[GridCell], list[GridC
     A fit is left out when it carries ``extreme_axis_ratio``, or when its
     centre lies more than ``max(WINDOW_OUTLIER_K * 1.4826 * MAD,
     WINDOW_FLOOR_FRACTION * median a)`` from the median centre in U or V.
-    The median and MAD are those of the other normal fits on the same RENA (a
-    whole ASIC can sit at its own U/V offset, e.g. RENA 1 of N8 B26 in the
-    test acquisition, ~770 ADC away), or of the whole board for a RENA with
-    fewer than :data:`WINDOW_MIN_GROUP` fits. Without any fit left, every fit
+    The median and MAD are those of the normal fits on the same RENA, the
+    fit itself included (a whole ASIC can sit at its own U/V offset, e.g.
+    RENA 1 of N8 B26 in the test acquisition, ~770 ADC away), or of the whole
+    board for a RENA with fewer than :data:`WINDOW_MIN_GROUP` fits. Without any fit left, every fit
     is used.
 
     Returns:
@@ -533,8 +534,8 @@ def _after_half(cells: Collection[GridCell], used: list[GridCell]) -> float:
 
 
 _LEFT_OUT_NOTE = (
-    "Left out of the board's common window (extreme axis ratio, or a centre far from its "
-    "RENA's other fits): it may be clipped"
+    "Left out of the board's common window (extreme axis ratio, or a centre far from the "
+    "median centre of its RENA's fits): it may be clipped"
 )
 
 

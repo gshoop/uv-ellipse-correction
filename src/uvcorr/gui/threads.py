@@ -83,6 +83,7 @@ __all__ = [
     "RefitThread",
     "RevertThread",
     "error_text",
+    "log_failure",
 ]
 
 # Errors whose message is written for the user; anything else gets its type.
@@ -111,6 +112,22 @@ def error_text(exc: BaseException) -> str:
     if isinstance(exc, _USER_ERRORS):
         return text or type(exc).__name__
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def log_failure(what: str, exc: BaseException) -> None:
+    """Log the failure of a worker's operation (called inside the ``except`` block).
+
+    An error whose message is written for the user (a busy cache, a file
+    that is not raw data, a failed board, ...) is expected: it is logged as
+    a warning without a traceback (the traceback is added at the DEBUG level,
+    ``uvcorr-gui -vv``). Anything else is unexpected and logged with its
+    traceback.
+    """
+    if isinstance(exc, _USER_ERRORS):
+        debug = logger.isEnabledFor(logging.DEBUG)
+        logger.warning(f"{what} failed: {error_text(exc)}", exc_info=exc if debug else None)
+    else:
+        logger.exception(f"{what} failed")
 
 
 class _WorkerThread(QThread):
@@ -146,7 +163,7 @@ class _WorkerThread(QThread):
             self.stopped.emit()
             return
         except Exception as exc:
-            logger.exception(f"{self._LABEL} failed")
+            log_failure(self._LABEL, exc)
             self.error.emit(error_text(exc))
             return
         self.finished.emit(value)
@@ -392,7 +409,7 @@ class ChannelDetailThread(QThread):
                 self.done.emit(self.generation, detail)
                 views = None if self._skip_views.is_set() else self._compute_views(detail)
             except Exception as exc:
-                logger.exception(f"Loading {self.request.key} failed")
+                log_failure(f"Loading {self.request.key}", exc)
                 self.failed.emit(self.generation, error_text(exc))
                 ended = True
                 return
@@ -412,12 +429,12 @@ class ChannelDetailThread(QThread):
         try:
             radial = compute_radial_view(detail)
         except Exception as exc:
-            logger.exception(f"Computing the Radial tab of {self.request.key} failed")
+            log_failure(f"Computing the Radial tab of {self.request.key}", exc)
             errors.append(f"radial histograms: {error_text(exc)}")
         try:
             angle = compute_angle_view(detail)
         except Exception as exc:
-            logger.exception(f"Computing the Radius vs angle tab of {self.request.key} failed")
+            log_failure(f"Computing the Radius vs angle tab of {self.request.key}", exc)
             errors.append(f"radius vs angle: {error_text(exc)}")
         return DetailViews(radial, angle, "; ".join(errors), time.perf_counter() - t_start)
 
@@ -461,7 +478,7 @@ class BoardGridThread(QThread):
             board_uv = self.session.board_data(self.node, self.board, self.cache)
             data = compute_board_grid(board_uv, self.results)
         except Exception as exc:
-            logger.exception(f"Computing the board grid of node {self.node} board {self.board}")
+            log_failure(f"Computing the board grid of node {self.node} board {self.board}", exc)
             self.failed.emit(self.generation, error_text(exc))
             return
         self.done.emit(self.generation, data)

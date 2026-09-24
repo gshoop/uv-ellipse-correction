@@ -106,6 +106,7 @@ from uvcorr.cache import (
     UVCache,
     UVCacheError,
     default_cache_path,
+    no_valid_frames_message,
     open_or_build,
 )
 from uvcorr.channels import electrode_label, is_active_channel, polarity_name
@@ -116,10 +117,13 @@ from uvcorr.io.summary_csv import write_summary_csv
 from uvcorr.io.tec import write_tec
 from uvcorr.options import (
     FLAG_GAUSS_FIT_FAILED_PRE,
+    ROBUST_ONLY_FIELDS,
     STATUS_FIT_FAILED,
     STATUS_OK,
     STATUS_TOO_FEW_EVENTS,
     FitOptions,
+    effective_options,
+    same_fit,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,12 +150,12 @@ __all__ = [
     "channel_view",
     "channel_title",
     "describe_options_change",
-    "effective_options",
+    "effective_options",  # re-exported from uvcorr.options
     "inspect_raw",
     "is_cache_file",
     "load_cache",
     "load_raw",
-    "same_fit",
+    "same_fit",  # re-exported from uvcorr.options
     "short_title",
 ]
 
@@ -368,16 +372,21 @@ def load_raw(
 
     Blocking; run it in a worker thread. See
     :func:`~uvcorr.cache.open_or_build` for the build. A file without any
-    event on an active channel (not raw data, an empty acquisition) is
-    refused, and a cache this call built for it is removed again, so no
-    empty "valid" cache is left behind.
+    valid frame (not raw data, an empty file) fails the build itself
+    (:class:`~uvcorr.cache.CacheBuildError`, no cache is written). A raw
+    file without any event on an active channel is refused too, and a cache
+    this call built for it is removed again, so no empty "valid" cache is
+    left behind.
 
     Raises:
         FileNotFoundError: If ``dat_path`` does not exist.
-        NoEventsError: If the file yields no events.
+        NoEventsError: If the file (or its reused cache) holds no events on
+            active channels.
         CacheBuildCancelled: If ``stop_flag`` stopped a build.
-        CacheBusyError, CacheBuildError, ResultsError: See ``open_or_build``
-            and :meth:`~uvcorr.cache.UVCache.load_results`.
+        CacheBuildError: If the build failed, e.g. ``"no valid frames in
+            <file>: is this a raw .dat file?"``.
+        CacheBusyError, ResultsError: See ``open_or_build`` and
+            :meth:`~uvcorr.cache.UVCache.load_results`.
     """
     t_start = time.perf_counter()
     dat = Path(dat_path)
@@ -430,14 +439,21 @@ def load_cache(cache_path: str | Path) -> OpenedFile:
 
 
 def _require_events(cache: UVCache, source: Path | None, *, remove_if_empty: bool) -> None:
-    """Raise :class:`NoEventsError` if the cache holds no events (optionally deleting it)."""
+    """Raise :class:`NoEventsError` if the cache holds no events (optionally deleting it).
+
+    A build no longer writes a cache for a file without valid frames (it
+    raises :class:`~uvcorr.cache.CacheBuildError`) and such a cache is never
+    reused (:meth:`~uvcorr.cache.UVCache.is_valid_for`), but one built by an
+    earlier uvcorr can still be opened directly (:func:`load_cache`); it gets
+    the build's message.
+    """
     if cache.board_event_counts():
         return
     metadata = cache.metadata()
-    name = source.name if source is not None else cache.path.name
     if metadata.get("parser_frames") == 0:
-        message = f"No valid frames in {name}: is this a raw .dat file?"
+        message = no_valid_frames_message(source if source is not None else cache.path)
     else:
+        name = source.name if source is not None else cache.path.name
         message = f"{name} holds no events on active channels"
     if remove_if_empty:
         try:
@@ -565,34 +581,11 @@ _OPTION_CHANGE_TEXT: dict[str, Callable[[Any], str]] = {
 }
 
 
-_DEFAULT_OPTIONS = FitOptions()
-_ROBUST_ONLY = frozenset({"clip_k", "max_iter"})
-
-
-def effective_options(options: FitOptions) -> FitOptions:
-    """The options as the fit uses them.
-
-    Without the robust iteration, ``clip_k`` and ``max_iter`` have no effect
-    (:func:`~uvcorr.ellipse.fit_ellipse`), so they are set to their defaults:
-    two option sets fit identically exactly when their effective options are
-    equal. The override-or-revert decision, the Fit All override check and
-    every description of an options change compare effective options.
-    """
-    if options.robust:
-        return options
-    return replace(options, clip_k=_DEFAULT_OPTIONS.clip_k, max_iter=_DEFAULT_OPTIONS.max_iter)
-
-
-def same_fit(options: FitOptions, other: FitOptions) -> bool:
-    """Whether two option sets fit identically (equal :func:`effective_options`)."""
-    return effective_options(options) == effective_options(other)
-
-
 def describe_options_change(options: FitOptions, reference: FitOptions) -> str:
     """The effective options that differ from ``reference``, e.g. ``"robust off, clip k 3"``.
 
-    Both sides are compared as :func:`effective_options`, and clip k and
-    max iter are not listed when ``options`` has robust off.
+    Both sides are compared as :func:`~uvcorr.options.effective_options`,
+    and clip k and max iter are not listed when ``options`` has robust off.
 
     Returns:
         The changed options in the control band's order (robust, clip k,
@@ -604,7 +597,7 @@ def describe_options_change(options: FitOptions, reference: FitOptions) -> str:
     # The control band's order first, then any other option
     names = [*_OPTION_CHANGE_TEXT, *(name for name in after if name not in _OPTION_CHANGE_TEXT)]
     if not options.robust:  # clip k and max iter mean nothing without the robust iteration
-        names = [name for name in names if name not in _ROBUST_ONLY]
+        names = [name for name in names if name not in ROBUST_ONLY_FIELDS]
     parts: list[str] = []
     for name in names:
         value = after[name]
@@ -863,8 +856,8 @@ class RefitRequest:
     def as_override(self) -> bool:
         """The options fit differently from the batch options: the results become overrides.
 
-        Compared as :func:`effective_options` (with robust off, clip k and
-        max iter do not matter).
+        Compared as :func:`~uvcorr.options.effective_options` (with robust
+        off, clip k and max iter do not matter).
         """
         return not same_fit(self.options, self.stored.options)
 
@@ -1427,8 +1420,9 @@ class UVSession:
         unless ``workers`` is 1), then stores the results as the new
         ``/results/current``, keeping or discarding the overrides, and reads
         them back. Kept overrides fitted with the new batch options
-        (:func:`same_fit`) are dropped in the same write: the new batch rows
-        reproduce them. Does not change the session: pass the outcome to
+        (:func:`~uvcorr.options.same_fit`) are dropped in the same write: the
+        new batch rows reproduce them (``uvcorr process`` applies the same
+        rule). Does not change the session: pass the outcome to
         :meth:`apply_batch` on the GUI thread.
 
         Args:
@@ -1552,14 +1546,16 @@ class UVSession:
 
         - options different from the batch options: the results are stored
           as overrides, in one cache write;
-        - options that fit like the batch options (:func:`same_fit`): the
-          re-fit reproduces the batch, so the channels' overrides are
-          deleted and nothing is stored. (A channel without a batch row,
-          which only results written by a newer uvcorr can leave, keeps its
-          re-fit as an override, in the same write.)
+        - options that fit like the batch options
+          (:func:`~uvcorr.options.same_fit`): the re-fit reproduces the
+          batch, so the channels' overrides are deleted and nothing is
+          stored. (A channel without a batch row, which only results written
+          by a newer uvcorr can leave, keeps its re-fit as an override, in
+          the same write.)
 
-        The write checks that the stored batch is still the one the request
-        saw (another process may have replaced it).
+        The cache checks that the stored batch is still the one the request
+        saw (another process may have replaced it), also when there is
+        nothing to store or delete.
 
         Does not change the session: pass the outcome to :meth:`apply_refit`
         on the GUI thread.
@@ -1798,11 +1794,15 @@ class UVSession:
         return () if request is None else self.apply_revert(self.run_revert(request))
 
     def overrides_fitting_like(self, options: FitOptions) -> list[ChannelKey]:
-        """Overrides whose options fit like ``options`` (a Fit All with them drops these)."""
+        """Overrides a Fit All with ``options`` reproduces and so drops.
+
+        See :meth:`~uvcorr.cache.StoredOverride.reproduced_by` (options that
+        fit alike; never an override with options of a newer uvcorr).
+        """
         stored = self._stored
         if stored is None:
             return []
-        return sorted(key for key, o in stored.overrides.items() if same_fit(o.options, options))
+        return sorted(key for key, o in stored.overrides.items() if o.reproduced_by(options))
 
     def results_changed_on_disk(self) -> bool:
         """Whether the cache's batch results are not the ones the session loaded.

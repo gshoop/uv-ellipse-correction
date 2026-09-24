@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import os
 import shutil
@@ -265,21 +266,77 @@ def test_rebuild_warns_once_about_discarded_results(
     with caplog.at_level(logging.WARNING):
         code, _, err = run(["build-cache", str(dat), "--force"], capsys)
     assert code == cli.EXIT_OK
-    assert err.count("rebuilding the cache discards them") == 1
+    assert err.count("a successful rebuild will discard them") == 1
     # The library's own log record is filtered out while the CLI reports it.
     assert not [r for r in caplog.records if "/results" in r.getMessage()]
     assert not UVCache(default_cache_path(dat)).has_results()
 
 
-def test_file_without_frames_warns(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+@pytest.mark.parametrize("content", [b"not a raw acquisition\n" * 100, b""], ids=["text", "empty"])
+def test_file_without_frames_is_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], content: bytes
+) -> None:
     dat = tmp_path / "notes.dat"
-    dat.write_bytes(b"not a raw acquisition\n" * 100)
+    dat.write_bytes(content)
     code, out, err = run(["build-cache", str(dat)], capsys)
-    assert code == cli.EXIT_OK
-    assert err.count("no valid frames") == 1 and "raw .dat" in err
+    assert code == cli.EXIT_ERROR
+    assert f"error: no valid frames in {dat}: is this a raw .dat file?" in err
+    assert out == ""
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.dat"]  # no cache, no tmp
+    # process fails the same way, before any analysis
+    code, out, err = run(["process", str(dat), "--output-dir", str(tmp_path / "out")], capsys)
+    assert code == cli.EXIT_ERROR
+    assert f"error: no valid frames in {dat}: is this a raw .dat file?" in err
+    assert "Fitting" not in err and out == ""
+    assert not default_cache_path(dat).exists()
+
+
+def test_file_without_frames_leaves_the_previous_cache(
+    ring_files: RingFiles, capsys: pytest.CaptureFixture[str]
+) -> None:
+    uv = UVCache(ring_files.cache)
+    uv.save_results([], FitOptions())
+    before = hashlib.sha256(ring_files.cache.read_bytes()).hexdigest()
+    ring_files.dat.write_bytes(b"\x00" * 4096)  # the raw file is replaced by junk
+    code, _, err = run(["build-cache", str(ring_files.dat)], capsys)
+    assert code == cli.EXIT_ERROR and "no valid frames" in err
+    assert hashlib.sha256(ring_files.cache.read_bytes()).hexdigest() == before
+    assert uv.tmp_files() == []
+
+
+def test_old_cache_of_a_file_without_frames_is_not_reused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cache an earlier uvcorr built from a file without frames is rebuilt, which fails."""
+    junk = tmp_path / "junk.dat"
+    junk.write_bytes(b"\x00" * 4096)
+    inactive = write_dat(tmp_path / "inactive.dat", [Frame(1, 15, 0, 1, (Hit(2, 1, 5, 5),))])
+    old = UVCache(default_cache_path(junk))
+    old.build_from_dat(inactive)
+    with h5py.File(old.path, "r+") as h5f:  # what an earlier uvcorr wrote for junk.dat
+        meta = h5f["metadata"].attrs
+        meta["parser_frames"] = 0
+        meta["source_size"] = junk.stat().st_size
+        meta["source_mtime"] = junk.stat().st_mtime
+        meta["source_hash"] = cache.compute_source_hash(junk)
+    before = old.path.read_bytes()
+    code, out, err = run(["build-cache", str(junk)], capsys)
+    assert code == cli.EXIT_ERROR and out == ""
+    assert "not a valid cache for this .dat" in err  # not reused
+    assert f"error: no valid frames in {junk}: is this a raw .dat file?" in err
+    assert old.path.read_bytes() == before and old.tmp_files() == []
+
+
+def test_raw_file_with_only_inactive_channels_is_a_valid_empty_cache(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dat = write_dat(tmp_path / "inactive.dat", [Frame(1, 15, 0, 1, (Hit(2, 1, 5, 5),))])
+    code, out, err = run(["build-cache", str(dat)], capsys)
+    assert code == cli.EXIT_OK, err
     assert "events kept:   0 on 0 boards (none)" in out
-    code, _, err = run(["build-cache", str(dat)], capsys)  # also when reused
-    assert code == cli.EXIT_OK and "no valid frames" in err
+    assert "dropped:       1 on inactive channels" in out
+    assert "no valid frames" not in err
+    assert UVCache(default_cache_path(dat)).is_valid_for(dat)
 
 
 def test_summary_reports_uv_zero_events(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -458,6 +515,115 @@ def test_process_applies_and_discards_overrides(
     assert stored is not None and stored.overrides == {}
     assert rows[key].options_source == "batch"
     assert rows[key].centerU == pytest.approx(batch_row.centerU, rel=1e-8)
+
+
+def _store_override(uv: UVCache, key: ChannelKey, options: FitOptions) -> None:
+    uv.save_override(analyze_channel(key, *uv.channel_data(*key), options), options)
+
+
+def test_process_drops_overrides_the_batch_reproduces(
+    ring_files: RingFiles, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``process`` applies the GUI's Fit All rule: an override that fits like the batch goes."""
+    out = tmp_path / "out"
+    assert run_process(ring_files, out, capsys, "--workers", "1")[0] == cli.EXIT_OK
+    uv = UVCache(ring_files.cache)
+    plain = ChannelKey(1, 15, 0, 12)  # robust off
+    odd = ChannelKey(1, 16, 0, 12)  # robust off, clip k 3: fits exactly like robust off
+    other = ChannelKey(4, 29, 0, 12)  # robust off, min events 50: fits differently
+    _store_override(uv, plain, FitOptions(robust=False))
+    _store_override(uv, odd, FitOptions(robust=False, clip_k=3.0))
+    _store_override(uv, other, FitOptions(robust=False, min_events=50))
+
+    # A default batch reproduces none of them: all three are applied and kept
+    code, stdout, _ = run_process(ring_files, out, capsys, "--workers", "1")
+    assert code == cli.EXIT_OK and "overrides:  3 applied" in stdout
+    assert "match the batch options" not in stdout
+    stored = uv.load_results()
+    assert stored is not None and sorted(stored.overrides) == sorted([plain, odd, other])
+
+    # A --no-robust batch reproduces two: they are neither applied nor kept
+    code, stdout, stderr = run_process(ring_files, out, capsys, "--workers", "1", "--no-robust")
+    assert code == cli.EXIT_OK, stderr
+    assert "overrides:  1 applied" in stdout
+    assert "2 overrides now match the batch options and were dropped" in stdout
+    stored = uv.load_results()
+    assert stored is not None and list(stored.overrides) == [other]
+    assert stored.options == FitOptions(robust=False)
+    rows = {r.key: r for r in read_summary_csv(out / "radial_summary.csv")}
+    assert rows[plain].options_source == "batch" and rows[odd].options_source == "batch"
+    assert rows[other].options_source == "override"
+
+    # The same batch again: nothing left to drop
+    code, stdout, _ = run_process(ring_files, out, capsys, "--workers", "1", "--no-robust")
+    assert code == cli.EXIT_OK and "overrides:  1 applied" in stdout
+    assert "match the batch options" not in stdout
+
+
+def test_process_matching_override_on_a_read_only_cache(
+    ring_files: RingFiles, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    uv = UVCache(ring_files.cache)
+    uv.save_results([], FitOptions())
+    key = ChannelKey(1, 15, 0, 12)
+    _store_override(uv, key, FitOptions(clip_k=3.0))
+    before = uv.load_results()
+    ring_files.cache.chmod(0o444)
+    try:
+        code, stdout, stderr = run_process(
+            ring_files, tmp_path / "out", capsys, "--workers", "1", "--clip-k", "3"
+        )
+    finally:
+        ring_files.cache.chmod(0o644)
+    assert code == cli.EXIT_OK, stderr
+    assert "overrides:  0 applied" in stdout
+    assert (
+        "1 override matches the batch options and was not applied (the batch reproduces them)"
+        in stdout
+    )
+    rows = {r.key: r for r in read_summary_csv(tmp_path / "out" / "radial_summary.csv")}
+    assert rows[key].options_source == "batch"
+    assert uv.load_results() == before  # nothing stored, nothing dropped
+
+
+def test_process_keeps_overrides_with_options_of_a_newer_version(
+    ring_files: RingFiles, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An override whose stored options have an unknown key is never taken as reproduced."""
+    uv = UVCache(ring_files.cache)
+    uv.save_results([], FitOptions())
+    key = ChannelKey(1, 15, 0, 12)
+    _store_override(uv, key, FitOptions(robust=False))
+    with h5py.File(ring_files.cache, "r+") as h5f:
+        path = "results/current/overrides/table"
+        table = h5f[path][()]
+        table["options_json"][0] = json.dumps(
+            FitOptions(robust=False).to_dict() | {"future_option": 1}
+        )
+        del h5f[path]
+        h5f.create_dataset(path, data=table)
+    code, stdout, stderr = run_process(ring_files, tmp_path / "out", capsys, "--no-robust")
+    assert code == cli.EXIT_OK, stderr
+    assert "overrides:  1 applied" in stdout and "match the batch options" not in stdout
+    rows = {r.key: r for r in read_summary_csv(tmp_path / "out" / "radial_summary.csv")}
+    assert rows[key].options_source == "override"
+    stored = uv.load_results()
+    assert stored is not None and list(stored.overrides) == [key]
+    assert stored.overrides[key].unknown_options == ("future_option",)
+
+
+def test_matching_overrides_text() -> None:
+    assert (
+        cli._matching_overrides_text(1, dropped=True)
+        == "1 override now matches the batch options and was dropped"
+    )
+    assert (
+        cli._matching_overrides_text(1_200, dropped=True)
+        == "1,200 overrides now match the batch options and were dropped"
+    )
+    assert cli._matching_overrides_text(2, dropped=False).startswith(
+        "2 overrides match the batch options and were not applied"
+    )
 
 
 def test_process_ctrl_c_stops_the_analysis(

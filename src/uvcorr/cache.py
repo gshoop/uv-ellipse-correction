@@ -45,9 +45,9 @@ stores or deletes (:meth:`UVCache.replace_overrides`, which
 :meth:`UVCache.save_overrides` and :meth:`UVCache.delete_overrides` use).
 The override writes take an optional ``expected_created_at``: the
 ``created_at`` of the batch results the caller loaded, checked under the
-write handle, so a caller holding results that another process has since
-replaced gets a :class:`StaleResultsError` instead of writing into the new
-results. Readers ignore leftover ``_new`` groups
+write handle (or a read-only handle when there is nothing to write), so a
+caller holding results that another process has since replaced gets a
+:class:`StaleResultsError` instead of writing into the new results. Readers ignore leftover ``_new`` groups
 and fall back to ``_old`` if a swap was interrupted; the next write cleans
 both up.
 This protects against errors and ordinary interruptions, not against power
@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import logging
 import math
 import os
@@ -79,6 +80,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from dataclasses import fields as dataclass_fields
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -88,7 +90,7 @@ import numpy as np
 import numpy.typing as npt
 
 from uvcorr import __version__
-from uvcorr.options import FLAG_SEPARATOR, FLAGS, STATUSES, FitOptions
+from uvcorr.options import FLAG_SEPARATOR, FLAGS, STATUSES, FitOptions, same_fit
 
 if TYPE_CHECKING:
     from adc2kev.parser import EventBatch
@@ -131,6 +133,7 @@ __all__ = [
     "default_cache_path",
     "estimate_cache_bytes",
     "merge_results",
+    "no_valid_frames_message",
     "open_or_build",
 ]
 
@@ -179,8 +182,8 @@ LOCK_RETRY_INTERVAL = 0.05
 
 USER_WARNING = "uvcorr_user_warning"
 """LogRecord attribute set on warnings addressed to the end user (a rebuild
-discarding stored ``/results``; a file without valid frames). Front ends that
-report these conditions themselves (the CLI) filter such records out."""
+discarding stored ``/results``). Front ends that report these conditions
+themselves (the CLI) filter such records out."""
 
 # Board groups are keyed internally by node * 64 + board (a board is 6 bits).
 _BOARD_KEY_SHIFT = 6
@@ -364,11 +367,26 @@ class StoredOverride:
 
     Attributes:
         result: The channel's result (``options_source="override"``).
-        options: The options it was fitted with.
+        options: The options it was fitted with, as far as this uvcorr knows
+            them.
+        unknown_options: Option names in the stored options that this
+            uvcorr does not know (written by a newer uvcorr; ``options``
+            leaves them out), sorted.
     """
 
     result: ChannelResult
     options: FitOptions
+    unknown_options: tuple[str, ...] = ()
+
+    def reproduced_by(self, batch_options: FitOptions) -> bool:
+        """Whether a batch with ``batch_options`` reproduces this override (it is then dropped).
+
+        True when the options fit alike (:func:`~uvcorr.options.same_fit`).
+        Never for an override with :attr:`unknown_options`: this uvcorr cannot
+        tell what they do, so such an override is always kept
+        (:meth:`UVCache.save_results` applies the same rule).
+        """
+        return not self.unknown_options and same_fit(self.options, batch_options)
 
 
 @dataclass(frozen=True)
@@ -416,6 +434,16 @@ def merge_results(
             result = replace(result, options_source="override")
         merged[result.key] = result
     return [merged[key] for key in sorted(merged)]
+
+
+def no_valid_frames_message(source: str | Path) -> str:
+    """The error text for a source file in which the parser found no valid frame.
+
+    ``"no valid frames in <source>: is this a raw .dat file?"``: raised by
+    :meth:`UVCache.build_from_dat` (as :class:`CacheBuildError`) and reported
+    by the GUI for a cache an earlier uvcorr built from such a file.
+    """
+    return f"no valid frames in {source}: is this a raw .dat file?"
 
 
 def default_cache_path(dat_path: str | Path) -> Path:
@@ -550,7 +578,11 @@ class UVCache:
         The cache version, the source size, mtime and the hash of its first
         MiB must all match (pattern of adc2kev's ``DiagnosticCache``). A
         missing or unreadable cache, a file that is not a UV cache, or a
-        missing raw file, is not valid. A cache that another process has open
+        missing raw file, is not valid. Nor is a cache that records no valid
+        frame (``parser_frames == 0``, which only an earlier uvcorr wrote for a
+        file that is not raw data): rebuilding it raises the
+        :class:`CacheBuildError` of :meth:`build_from_dat` instead of reusing
+        an empty cache silently. A cache that another process has open
         for writing is *not* reported invalid (a rebuild would discard that
         process's work): :class:`CacheBusyError` is raised instead.
 
@@ -579,6 +611,8 @@ class UVCache:
                 for name, value in expected.items():
                     if not _attr_equals(meta.get(name), value):
                         return False
+                if _attr_equals(meta.get("parser_frames"), 0):
+                    return False  # built by an earlier uvcorr from a file without frames
                 if not _attr_equals(meta.get("source_hash"), compute_source_hash(dat_path)):
                     return False
                 if "events" not in h5f:
@@ -611,6 +645,11 @@ class UVCache:
         success; on failure or cancellation this build's temporary file is
         removed and any previous cache file is left untouched.
 
+        A source file in which the parser finds no valid frame at all (not a
+        raw ``.dat`` file, or an empty file) is an error: no cache is written.
+        A raw file whose frames all carry inactive channels (or node 0) is
+        valid and gives an empty cache.
+
         Args:
             dat_path: Raw ``.dat`` acquisition file.
             progress_cb: Called after every parser batch with the fraction of
@@ -630,7 +669,9 @@ class UVCache:
             InsufficientDiskSpaceError: If the cache location lacks space.
             CacheBuildCancelled: If ``stop_flag`` requested a stop.
             CacheBuildError: If the target is unsuitable, the cache directory
-                cannot be created or written, or parsing or writing failed.
+                cannot be created or written, the file holds no valid frame
+                (``"no valid frames in <file>: is this a raw .dat file?"``), or
+                parsing or writing failed.
         """
         dat_path = Path(dat_path)
         if not dat_path.is_file():
@@ -644,8 +685,8 @@ class UVCache:
             raise CacheBuildError(f"Cannot use the cache path {self._path}: {exc}") from exc
         if discards_results:
             logger.warning(
-                f"Rebuilding UV cache {self._path}: its stored analysis results and "
-                "overrides (/results) are discarded",
+                f"Rebuilding UV cache {self._path}: a successful rebuild will discard its "
+                "stored analysis results and overrides (/results)",
                 extra={USER_WARNING: True},
             )
         _prepare_directory(self._path, dat_path.stat().st_size)
@@ -796,7 +837,13 @@ class UVCache:
                 the overrides it returns True for are not carried over (e.g.
                 those fitted with the new batch options, which the new batch
                 rows reproduce). Decided on the overrides as stored, in the
-                same write.
+                same write. Only rows this uvcorr can decode, and whose
+                stored options have no key unknown to
+                :class:`~uvcorr.options.FitOptions` (written by a newer
+                uvcorr), are offered to it; every other row is kept. The
+                kept rows are copied verbatim (unknown columns and rows
+                included), and the whole table as it is when nothing is
+                dropped.
 
         Returns:
             The number of stored overrides not carried over (every one with
@@ -837,17 +884,7 @@ class UVCache:
                     elif drop_overrides is None:
                         _copy_overrides(current[_OVERRIDES], new)
                     else:
-                        entries = _read_override_entries(current)
-                        kept = {
-                            key: entry
-                            for key, entry in entries.items()
-                            if not drop_overrides(key, entry[1])
-                        }
-                        n_dropped = len(entries) - len(kept)
-                        if n_dropped:
-                            _write_override_entries(new, kept)
-                        else:  # nothing dropped: copy the table as it is
-                            _copy_overrides(current[_OVERRIDES], new)
+                        n_dropped = _copy_overrides_except(current, new, drop_overrides)
                 if current is not None:
                     group.move(_RESULTS_CURRENT, _RESULTS_OLD)
                 group.move(_RESULTS_NEW, _RESULTS_CURRENT)  # commit point
@@ -906,10 +943,7 @@ class UVCache:
                 attrs = current.attrs
                 options = FitOptions.from_json(_attr_text(attrs["options_json"]), strict=False)
                 rows = _decode_results(current[_TABLE][()], with_options=False)
-                overrides = {
-                    key: StoredOverride(result, opts)
-                    for key, (result, opts) in _read_override_entries(current).items()
-                }
+                overrides = _read_stored_overrides(current)
                 return StoredResults(
                     results=tuple(result for result, _ in rows),
                     options=options,
@@ -961,8 +995,8 @@ class UVCache:
         See :meth:`replace_overrides` (with nothing to delete).
 
         Returns:
-            The number of overrides stored (0 for no results; the file is
-            then not opened).
+            The number of overrides stored (0 for no results; nothing is
+            written then, but ``expected_created_at`` is still checked).
         """
         saved, _ = self.replace_overrides(results, options, expected_created_at=expected_created_at)
         return saved
@@ -1013,7 +1047,11 @@ class UVCache:
         Saved results are stored with ``options_source="override"`` and
         replace any override of their channel. Keys in ``delete`` without an
         override are ignored. Nothing is written when there is nothing to
-        change; with nothing to save or delete the file is not opened.
+        change. ``expected_created_at`` is checked in every case, also when
+        there is nothing to save or delete (the file is then only opened
+        read-only for the check, and not at all without
+        ``expected_created_at``), so a caller holding replaced results always
+        hears about it.
 
         Args:
             save: The re-fitted results to store, one per channel.
@@ -1024,7 +1062,9 @@ class UVCache:
             delete: The channels whose overrides are deleted.
             expected_created_at: The ``created_at`` of the batch results the
                 caller loaded (:attr:`StoredResults.created_at`); if the
-                stored results differ (or are gone), nothing is written.
+                stored results differ (or are gone), nothing is written and
+                :class:`StaleResultsError` is raised, even when there was
+                nothing to write.
 
         Returns:
             ``(saved, deleted)``: the numbers of overrides stored and deleted.
@@ -1061,6 +1101,7 @@ class UVCache:
         if both:
             raise ValueError(f"Channel(s) both saved and deleted: {both}")
         if not rows and not wanted:
+            self._check_stored_created_at(expected_created_at)  # read-only
             return 0, 0
         if not rows and not self._path.is_file():
             self._check_created_at(None, expected_created_at)
@@ -1112,6 +1153,16 @@ class UVCache:
             if _OVERRIDES in current:
                 del current[_OVERRIDES]
         return n
+
+    def _check_stored_created_at(self, expected: str | None) -> None:
+        """:meth:`_check_created_at` on a read-only open (a no-op without ``expected``)."""
+        if expected is None:
+            return
+        if not self._path.is_file():
+            self._check_created_at(None, expected)
+            return
+        with _open_h5(self._path) as h5f:
+            self._check_created_at(_current_results(h5f), expected)
 
     def _check_created_at(self, current: Any, expected: str | None) -> None:
         """Raise :class:`StaleResultsError` unless the stored results are the expected ones."""
@@ -1419,11 +1470,11 @@ def _build(
         accounted = counts.kept + counts.inactive + counts.node0
         if accounted != counts.parsed or counts.kept != sum(board_counts.values()):
             raise CacheBuildError(f"Inconsistent event counts during the build: {counts}")
-        if file_size > 0 and pstats.total_frames == 0:
-            logger.warning(
-                f"No valid frames in {dat_path} ({file_size:,} bytes): is this a raw .dat file?",
-                extra={USER_WARNING: True},
-            )
+        if pstats.total_frames == 0:
+            # Not raw data (or an empty file): refuse it rather than leave an empty
+            # cache that looks valid. A file whose frames all carry inactive
+            # channels has frames, and gives a valid (empty) cache.
+            raise CacheBuildError(no_valid_frames_message(dat_path))
 
         build_seconds = time.perf_counter() - t_start
         attrs = metadata.attrs
@@ -1584,6 +1635,13 @@ def _decode_results(
     Raises:
         ValueError, TypeError, KeyError: If the table cannot be decoded.
     """
+    return [(result, options) for _, result, options in _decode_rows(table, with_options)]
+
+
+def _decode_rows(
+    table: npt.NDArray[np.void], with_options: bool
+) -> list[tuple[int, ChannelResult, FitOptions | None]]:
+    """:func:`_decode_results` with each decoded row's index in ``table``."""
     from uvcorr import analysis
 
     names = set(table.dtype.names or ())
@@ -1620,7 +1678,7 @@ def _decode_results(
     }
     dropped_flags: set[str] = set()
     skipped: dict[str, set[str]] = {}
-    decoded: list[tuple[ChannelResult, FitOptions | None]] = []
+    decoded: list[tuple[int, ChannelResult, FitOptions | None]] = []
     for i in range(len(table)):
         row = {name: values[i] for name, values in columns.items()}
         bad = {k: row[k] for k, ok in allowed.items() if k in row and row[k] not in ok}
@@ -1632,7 +1690,7 @@ def _decode_results(
             flags = [f for f in str(row["flags"]).split(FLAG_SEPARATOR) if f]
             dropped_flags.update(f for f in flags if f not in known_flags)
             row["flags"] = tuple(f for f in flags if f in known_flags)
-        decoded.append((analysis.ChannelResult.from_dict(row), options[i]))
+        decoded.append((i, analysis.ChannelResult.from_dict(row), options[i]))
     if dropped_flags:
         logger.warning(f"Ignoring unknown flag(s) in the stored results: {sorted(dropped_flags)}")
     if skipped:
@@ -1725,6 +1783,66 @@ def _copy_overrides(source: Any, new: Any) -> None:
     if table is None:
         return
     new.create_group(_OVERRIDES).create_dataset(_TABLE, data=table[()])
+
+
+def _unknown_option_keys(text: str) -> tuple[str, ...]:
+    """Keys of a stored options JSON object that :class:`FitOptions` does not have (sorted)."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return ()  # not decodable at all: FitOptions.from_json raises for it
+    if not isinstance(data, dict):
+        return ()
+    known = {f.name for f in dataclass_fields(FitOptions)}
+    return tuple(sorted(str(key) for key in data if key not in known))
+
+
+def _read_stored_overrides(current: Any) -> dict[ChannelKey, StoredOverride]:
+    """The overrides of a results group, with the option keys this uvcorr does not know."""
+    table = _override_table(current)
+    if table is None:
+        return {}
+    raw = table[()]
+    overrides: dict[ChannelKey, StoredOverride] = {}
+    for index, result, options in _decode_rows(raw, with_options=True):
+        assert options is not None
+        unknown = _unknown_option_keys(_attr_text(raw[_OPTIONS_COLUMN][index]))
+        overrides[result.key] = StoredOverride(result, options, unknown)
+    return dict(sorted(overrides.items()))
+
+
+def _copy_overrides_except(
+    current: Any, new: Any, drop: Callable[[ChannelKey, FitOptions], bool]
+) -> int:
+    """Copy the overrides of ``current`` into group ``new``, leaving out those ``drop`` selects.
+
+    ``drop`` is only asked about rows that decode and whose stored options
+    have no unknown key (:attr:`StoredOverride.unknown_options`); every other
+    row is kept. The table is filtered as stored, so the kept rows (and any
+    column this uvcorr does not know) are copied verbatim, and nothing is
+    decoded back or re-encoded; with nothing dropped the table is copied as
+    it is.
+
+    Returns:
+        The number of rows left out.
+    """
+    table = _override_table(current)
+    if table is None:
+        return 0
+    raw = table[()]
+    keep = np.ones(len(raw), dtype=bool)
+    for index, result, options in _decode_rows(raw, with_options=True):
+        assert options is not None
+        if _unknown_option_keys(_attr_text(raw[_OPTIONS_COLUMN][index])):
+            continue  # options of a newer uvcorr: not known to be reproduced
+        if drop(result.key, options):
+            keep[index] = False
+    n_dropped = int(np.count_nonzero(~keep))
+    if n_dropped == 0:
+        _copy_overrides(current[_OVERRIDES], new)
+    elif n_dropped < len(raw):
+        new.create_group(_OVERRIDES).create_dataset(_TABLE, data=raw[keep])
+    return n_dropped
 
 
 def _read_override_entries(current: Any) -> _OverrideEntries:

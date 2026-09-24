@@ -24,9 +24,10 @@ from tests.gui.ring_cache import (
     TOO_FEW,
     store_batch_results,
 )
+from tests.synthetic_dat import Frame, Hit, write_dat
 from uvcorr import cache as cache_module
 from uvcorr.analysis import OPTIONS_BATCH, OPTIONS_OVERRIDE, AnalysisCancelled, ChannelKey
-from uvcorr.cache import CacheBusyError, ResultsError, UVCache, UVCacheError
+from uvcorr.cache import CacheBuildError, CacheBusyError, ResultsError, UVCache, UVCacheError
 from uvcorr.ellipse import EllipseParams
 from uvcorr.gui._system_map_model import ChannelView
 from uvcorr.gui.session import (
@@ -115,18 +116,52 @@ def test_unreadable_results_do_not_block_the_open(results_files: RingFiles) -> N
     assert reopened.results_error is None and reopened.stored is not None
 
 
-def test_files_without_events_are_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize("content", [bytes(range(256)) * 64, b""], ids=["junk", "empty"])
+def test_files_without_frames_fail_the_build(tmp_path: Path, content: bytes) -> None:
     junk = tmp_path / "junk.dat"
-    junk.write_bytes(bytes(range(256)) * 64)
-    with pytest.raises(NoEventsError, match="No valid frames in junk.dat"):
+    junk.write_bytes(content)
+    with pytest.raises(CacheBuildError, match=r"no valid frames in .*junk\.dat: is this a raw"):
         load_raw(junk)
-    assert not (tmp_path / "junk.dat.uv.h5").exists()  # the empty cache is removed again
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["junk.dat"]  # no cache, no tmp
+
+
+def test_files_without_active_events_are_refused(tmp_path: Path) -> None:
+    inactive = write_dat(tmp_path / "inactive.dat", [Frame(1, 15, 0, 1, (Hit(2, 1, 5, 5),))])
+    with pytest.raises(NoEventsError, match="inactive.dat holds no events on active channels"):
+        load_raw(inactive)
+    assert not (tmp_path / "inactive.dat.uv.h5").exists()  # the empty cache is removed again
     # An empty cache opened directly is refused but left alone
     cache = UVCache(tmp_path / "empty.uv.h5")
-    cache.build_from_dat(junk)
-    with pytest.raises(NoEventsError, match="is this a raw .dat file"):
+    cache.build_from_dat(inactive)
+    with pytest.raises(NoEventsError, match="holds no events on active channels"):
         load_cache(cache.path)
     assert cache.path.exists()
+
+
+def test_old_cache_of_a_file_without_frames(tmp_path: Path) -> None:
+    """A cache an earlier uvcorr built from a file without frames (``parser_frames == 0``)."""
+    junk = tmp_path / "junk.dat"
+    junk.write_bytes(bytes(range(256)) * 64)
+    old = UVCache(tmp_path / "junk.dat.uv.h5")
+    inactive = write_dat(tmp_path / "inactive.dat", [Frame(1, 15, 0, 1, (Hit(2, 1, 5, 5),))])
+    old.build_from_dat(inactive)
+    with h5py.File(old.path, "r+") as h5f:  # what an earlier uvcorr wrote for junk.dat
+        meta = h5f["metadata"].attrs
+        meta["parser_frames"] = np.int64(0)
+        meta["source_path"] = str(junk)
+        meta["source_size"] = np.int64(junk.stat().st_size)
+        meta["source_mtime"] = float(junk.stat().st_mtime)
+        meta["source_hash"] = cache_module.compute_source_hash(junk)
+    before = old.path.read_bytes()
+    # Opened directly: refused, with the build's message, and left alone
+    with pytest.raises(NoEventsError) as info:
+        load_cache(old.path)
+    assert str(info.value) == f"no valid frames in {junk}: is this a raw .dat file?"
+    # Opened as raw data: never reused; the rebuild fails and leaves the file as it was
+    assert not old.is_valid_for(junk) and inspect_raw(junk).needs_build
+    with pytest.raises(CacheBuildError, match=r"no valid frames in .*junk\.dat: is this a raw"):
+        load_raw(junk)
+    assert old.path.read_bytes() == before and old.tmp_files() == []
 
 
 def test_load_cache_rejects_other_files(tmp_path: Path) -> None:
@@ -769,6 +804,38 @@ def test_refit_refuses_results_replaced_on_disk(
     session.install(load_cache(results_files.cache))
     assert not session.results_changed_on_disk()
     assert session.revert_overrides([CLEAN]) == (CLEAN,)
+
+
+@pytest.mark.parametrize("board", [False, True], ids=["channel", "board"])
+def test_refit_that_stores_nothing_still_checks_the_results_on_disk(
+    session: UVSession, results_files: RingFiles, board: bool
+) -> None:
+    """A batch-options re-fit without overrides writes nothing, but must not report
+    "matches the batch" against a batch another process has replaced."""
+    batch = session.batch_options
+    assert batch is not None and session.override_keys() == []
+    if board:
+        request = session.refit_request(batch, board=(CLEAN.node, CLEAN.board))
+    else:
+        request = session.refit_request(batch, channel=CLEAN)
+    assert not request.as_override and request.n_reverted == 0
+    # Without a change on disk it goes through and stores nothing
+    outcome = session.run_refit(request)
+    assert outcome.saved == () and outcome.removed == ()
+    assert "nothing stored" in outcome.describe()
+    session.apply_refit(outcome)
+    # Another process replaces the batch: the same re-fit is refused
+    _replace_batch_on_disk(results_files)
+    on_disk = UVCache(results_files.cache).load_results()
+    stale = (
+        session.refit_request(batch, board=(CLEAN.node, CLEAN.board))
+        if board
+        else session.refit_request(batch, channel=CLEAN)
+    )
+    with pytest.raises(SessionError, match=r"stored results changed on disk \(another process"):
+        session.run_refit(stale)
+    assert UVCache(results_files.cache).load_results() == on_disk
+    assert not session.batch_running
 
 
 def test_export_warns_about_results_replaced_on_disk(

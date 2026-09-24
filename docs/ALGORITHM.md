@@ -232,8 +232,12 @@ cells for unavailable values.
 venv/bin/python scripts/dump_uvd.py --cache <cache> --out uvd          # default: node 1 boards 15, 16; node 8 board 24
 source ~/root-install/bin/thisroot.sh && ~/DataProcessing/EllipseCorrection/RadialAnalysis --csv-only $PWD/uvd
 venv/bin/python scripts/compare_radial.py uvd --cache <cache> --min-events 6 --decompose --out comparison.csv
-# or: uvcorr process data.dat --no-robust --output-dir X; compare_radial.py uvd --uvcorr-dir X
+# or, on a scratch cache (a --no-robust run replaces the stored batch and drops the robust-off overrides):
+# uvcorr process data.dat --no-robust --cache /tmp/data.uv.h5 --output-dir X; compare_radial.py uvd --uvcorr-dir X
 ```
+
+`compare_radial.py --cache` only reads the cache. A `uvcorr process --no-robust` run on the real cache would make the
+robust-off fit its stored batch and drop every robust-off override, hence the scratch cache (built in about 21 s).
 
 There are two runs. The first covers three boards: node 1 boards 15 and 16 (plan 10.3) and node 8 board 24, a low-count board whose
 47 channels hold 1 to 19,516 events. It has 135 channels and 2.77M events, and RadialAnalysis `--csv-only` took 2.1 s.
@@ -504,8 +508,9 @@ Fits stay sane down to about 20 events: false flags jump from about 1 % to 8 % b
 median) is small next to the channels' own jitter (median 2.9 ns; about 1.1 ns thin, 6-8 ns broad). So 100 is
 conservative, and **50 would be defensible**: it matches `MIN_GAUSS_SAMPLES`, so every `ok` channel still gets a Gaussian fit, and it would add 88
 channels with about 6.6k events. **Not changed.** 100 is not wrong, the gain is 88 low-count channels (which channels get a `.tec` block
-is a policy choice), and the default is pinned by other code (CLI help text, a GUI test). Use `--min-events 50`, or 20 at the
-lowest, for more coverage.
+is a policy choice), and the census and the C++ comparisons in this document assume 100. The default is defined only in
+`FitOptions`: the CLI help and the GUI's control band read it from there, and `tests/test_options.py` pins it. Use
+`--min-events 50`, or 20 at the lowest, for more coverage.
 
 ### 7.5 `high_rejection_frac` (0.05) and `extreme_axis_ratio` (0.5): the second ellipse
 
@@ -604,15 +609,19 @@ real rings.
 
 | Step | Time | Notes |
 |------|-----:|-------|
-| Cache build (`uvcorr build-cache`, phase 1) | 22-23 s | 3.48 GB `.dat` → 1.26 GB cache (lzf + shuffle); parse alone about 11-12 s |
-| `uvcorr process`, cache reused, 8 workers | 14 s quiet; **17.3 s** analysis / 17.5 s total in the final run | The final run shared the machine with other jobs (load 4-6) |
+| Cache build (`uvcorr build-cache`) | 20.6-23 s | 3.48 GB `.dat` → 1.26 GB cache (lzf + shuffle), peak RSS 0.9 GB; the parse alone takes 11-16 s, depending on the run |
+| `uvcorr process`, cache reused, 8 workers | 16 s quiet (worker scaling below); **17.3 s** analysis / 17.5 s total in the final run | The final run shared the machine with other jobs (load 4-6) |
 | same with `--geometric` | 72 s | Measured with 18.5 s for the default run in the same conditions |
 | RadialAnalysis `--csv-only`, 135 channels, 2.8 M events | 2.1 s | For scale |
 | RadialAnalysis `--csv-only`, full file (6,557 `.uvd` files, 208 M events) | 1 min 54 s | Single-threaded, excluding the `.uvd` export |
 
-Worker scaling of `uvcorr process` (quiet machine; peak PSS of the process tree): 1 / 4 / 8 / 12 / 16 workers take
-96 / 26 / 14 / 12 / 11 s and use 0.5 / 1.5 / 2.5 / 3.5 / 4.4 GB. Workers run with single-threaded BLAS, which is 15-18 % faster than
-OpenBLAS's default of one thread per core. The default is min(8, cores).
+Worker scaling of the analysis, i.e. the fitting step of `uvcorr process` and of the GUI's Fit All (`analyze_all` with the
+default options, peak PSS of the whole process tree sampled every 50 ms): 1 / 4 / 8 / 12 / 16 workers take
+109 / 29 / 16 / 12 / 11 s and use 0.5 / 1.1 / 1.8 / 2.4 / 3.0 GB, about 0.17 GB per worker. Measured on 2026-09-24 with one
+fresh process per run, the cache file in the page cache and no other jobs on the machine (load average 0.6 before the
+runs). An earlier run the same day was 5-16 % slower at 1-4 workers and within 4 % at 8-16 (114 / 33 / 16 / 12.5 / 11 s,
+0.5 / 1.1 / 1.9 / 2.5 / 3.1 GB). Workers run with single-threaded BLAS, which is 15-18 % faster than OpenBLAS's default of
+one thread per core. The default is min(8, usable CPUs).
 
 ## 9. Reproducing
 

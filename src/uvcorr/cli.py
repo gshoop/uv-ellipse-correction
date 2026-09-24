@@ -14,18 +14,21 @@ Subcommands (plan section 8):
     (unless ``--discard-overrides``), then store the results in the cache
     (``/results/current``, keeping the overrides unless
     ``--discard-overrides``; skipped with a warning if the cache file is
-    read-only). The output directory is created and write-tested before the
-    analysis starts. Prints a status/flag census and timings. Options that
-    are not given keep their ``FitOptions`` defaults.
+    read-only). Overrides whose options fit like the new batch options
+    (:func:`uvcorr.options.same_fit`) are neither applied nor kept: the batch
+    reproduces them, the same rule as the GUI's Fit All. The output directory
+    is created and write-tested before the analysis starts. Prints a
+    status/flag census and timings. Options that are not given keep their
+    ``FitOptions`` defaults.
 
-Exit codes: 0 on success, 1 on an error (e.g. a failed build or analysis, an
-unusable cache path, a cache in use by another process, or too little disk
-space), 2 for a missing input file or bad arguments, 130 when stopped with
-Ctrl-C. Ctrl-C during a build or an analysis sets its stop flag: a build stops
-at its next check (within one parser batch), removes its temporary file and
-leaves any previous cache untouched; an analysis stops its workers at their
-next channel, and nothing is stored or written. Further Ctrl-Cs are ignored
-until that cleanup has finished.
+Exit codes: 0 on success, 1 on an error (e.g. a failed build or analysis, a
+file without any valid frame, an unusable cache path, a cache in use by
+another process, or too little disk space), 2 for a missing input file or bad
+arguments, 130 when stopped with Ctrl-C. Ctrl-C during a build or an analysis
+sets its stop flag: a build stops at its next check (within one parser
+batch), removes its temporary file and leaves any previous cache untouched;
+an analysis stops its workers at their next channel, and nothing is stored or
+written. Further Ctrl-Cs are ignored until that cleanup has finished.
 """
 
 from __future__ import annotations
@@ -64,7 +67,7 @@ from uvcorr.cache import (
 )
 from uvcorr.ellipse import MIN_FIT_POINTS
 from uvcorr.io.export import prepare_output_dir, write_outputs
-from uvcorr.options import FLAGS, STATUSES, FitOptions
+from uvcorr.options import FLAGS, STATUSES, FitOptions, same_fit
 
 logger = logging.getLogger(__name__)
 
@@ -350,15 +353,9 @@ def _run_build_cache(args: argparse.Namespace) -> int:
     except CacheBuildCancelled:
         print("build cancelled; no new cache was written.", file=sys.stderr)
         return EXIT_INTERRUPTED
-    except (UVCacheError, OSError) as exc:  # build errors, busy cache, disk space
+    except (UVCacheError, OSError) as exc:  # build errors (e.g. no valid frames), busy, disk
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
-
-    if int(meta.get("parser_frames", 0)) == 0 and int(meta.get("source_size", 0)) > 0:
-        print(
-            f"warning: no valid frames in {dat}: is this a raw .dat file?",
-            file=sys.stderr,
-        )
     return EXIT_OK
 
 
@@ -374,7 +371,7 @@ def _build_with_progress(cache: UVCache, dat: Path, *, force: bool) -> None:
     if cache.has_results():
         print(
             f"warning: {cache.path} stores analysis results/overrides (/results); "
-            "rebuilding the cache discards them",
+            "a successful rebuild will discard them",
             file=sys.stderr,
         )
     stop = threading.Event()
@@ -417,6 +414,17 @@ def _run_process(args: argparse.Namespace) -> int:
     read, and a read-only cache is detected (the run then still writes the
     outputs but does not store the results). The outputs are written before
     the results are stored, so a failure to store never loses the outputs.
+
+    Stored overrides fitted with options that fit like the batch options
+    (:func:`~uvcorr.options.same_fit`) are reproduced by the batch: they are
+    not applied to the outputs and are dropped when the results are stored,
+    as the GUI's Fit All does.
+
+    The census's ``N applied`` counts the overrides read before the analysis
+    (the ones in the outputs), while ``M ... dropped`` is counted when the
+    results are stored, on the overrides in the cache at that moment. The
+    two can disagree if another process (a GUI) changes the overrides while
+    the analysis runs.
     """
     dat: Path = args.dat
     if not dat.is_file():
@@ -450,10 +458,15 @@ def _run_process(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         overrides: list[ChannelResult] = []
+        n_matching = 0  # overrides the new batch reproduces (not applied, dropped on store)
         if not args.discard_overrides:
             stored = cache.load_results()
             if stored is not None:
-                overrides = [override.result for override in stored.overrides.values()]
+                for override in stored.overrides.values():
+                    if override.reproduced_by(options):
+                        n_matching += 1
+                    else:
+                        overrides.append(override.result)
 
         n_boards = len(cache.board_event_counts())
         workers = min(args.workers or default_workers(), max(n_boards, 1))
@@ -482,16 +495,28 @@ def _run_process(args: argparse.Namespace) -> int:
         return EXIT_ERROR
 
     store_error: Exception | None = None
+    stored_ok = False
     if store:
         try:
-            cache.save_results(results, options, keep_overrides=not args.discard_overrides)
+            n_dropped = cache.save_results(
+                results,
+                options,
+                keep_overrides=not args.discard_overrides,
+                drop_overrides=lambda _key, used: same_fit(used, options),
+            )
         except (UVCacheError, OSError, ValueError) as exc:
             store_error = exc
+        else:
+            stored_ok = True
+            if not args.discard_overrides:
+                n_matching = n_dropped  # decided on the overrides as stored
     t_store = time.perf_counter()
 
     status = "reused" if reused else "built"
     print(f"UV cache: {cache.path} ({status})")
     _print_census(merged, n_boards, workers, options, len(overrides), args.discard_overrides)
+    if n_matching:
+        print(f"              {_matching_overrides_text(n_matching, dropped=stored_ok)}")
     n_ok = sum(1 for r in merged if r.ok)
     print("Outputs:")
     print(f"  {tec_path}  ({n_ok:,} channel blocks, {_format_bytes(tec_path.stat().st_size)})")
@@ -513,6 +538,21 @@ def _run_process(args: argparse.Namespace) -> int:
         )
         return EXIT_ERROR
     return EXIT_OK
+
+
+def _matching_overrides_text(n: int, *, dropped: bool) -> str:
+    """Census text for ``n`` stored overrides that fit like the batch options.
+
+    ``dropped``: the results were stored, so the overrides were deleted from
+    the cache; otherwise they were only left out of the outputs.
+    """
+    if n == 1:
+        what, match, were = "1 override", "matches", "was"
+    else:
+        what, match, were = f"{n:,} overrides", "match", "were"
+    if dropped:
+        return f"{what} now {match} the batch options and {were} dropped"
+    return f"{what} {match} the batch options and {were} not applied (the batch reproduces them)"
 
 
 def _analyze_with_progress(

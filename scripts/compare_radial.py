@@ -9,8 +9,10 @@ Inputs:
   analyse; ``radial_summary.csv`` and the ``.tec`` give its results.
 - The uvcorr side, either
   ``--uvcorr-dir DIR`` with the ``radial_summary.csv`` (and ``.tec``) written by
-  ``uvcorr process --no-robust --output-dir DIR``, or ``--cache PATH``, which
-  runs ``analyze_board(cache, node, board, FitOptions(robust=False,
+  ``uvcorr process --no-robust --output-dir DIR`` (give that run a scratch
+  ``--cache``: it replaces the cache's stored batch and drops the overrides the
+  robust-off fit reproduces), or ``--cache PATH``, which runs
+  ``analyze_board(cache, node, board, FitOptions(robust=False,
   min_events=--min-events))`` on the boards of the ``.uvd`` files (read-only).
 
 What is compared, per channel and in aggregate:

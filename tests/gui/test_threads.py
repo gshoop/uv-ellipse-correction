@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import pytest
 from pytestqt.qtbot import QtBot
 
@@ -20,6 +23,7 @@ from uvcorr.gui.threads import (
     RefitThread,
     RevertThread,
     error_text,
+    log_failure,
 )
 from uvcorr.options import FitOptions
 
@@ -97,6 +101,43 @@ def test_channel_detail_thread(qtbot: QtBot, ring_files: RingFiles) -> None:
         thread.start()
     thread.wait()
     assert blocker.args[0] == 7 and blocker.args[1].key == key
+
+
+def test_non_raw_file_is_a_user_error_without_traceback(
+    qtbot: QtBot, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    junk = tmp_path / "junk.dat"
+    junk.write_bytes(b"\x00" * 4096)
+    thread = CacheBuildThread(junk)
+    with caplog.at_level(logging.INFO, logger="uvcorr.gui.threads"):
+        with qtbot.waitSignal(thread.error, timeout=20_000) as blocker:
+            thread.start()
+        thread.wait()
+    assert blocker.args[0] == f"no valid frames in {junk}: is this a raw .dat file?"
+    records = [r for r in caplog.records if r.name == "uvcorr.gui.threads"]
+    assert [r.levelno for r in records] == [logging.WARNING]
+    assert records[0].exc_info is None and "no valid frames" in records[0].getMessage()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["junk.dat"]
+
+
+def test_log_failure(caplog: pytest.LogCaptureFixture) -> None:
+    def failing(exc: Exception) -> None:
+        try:
+            raise exc
+        except Exception as caught:
+            log_failure("Doing it", caught)
+
+    with caplog.at_level(logging.INFO, logger="uvcorr.gui.threads"):
+        failing(UVCacheError("the cache is busy"))  # written for the user: no traceback
+        failing(RuntimeError("a bug"))  # unexpected: traceback
+    user, bug = caplog.records
+    assert user.levelno == logging.WARNING and user.exc_info is None
+    assert user.getMessage() == "Doing it failed: the cache is busy"
+    assert bug.levelno == logging.ERROR and bug.exc_info is not None
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="uvcorr.gui.threads"):
+        failing(UVCacheError("the cache is busy"))  # -vv: the traceback is added
+    assert caplog.records[0].levelno == logging.WARNING and caplog.records[0].exc_info
 
 
 def test_error_text() -> None:

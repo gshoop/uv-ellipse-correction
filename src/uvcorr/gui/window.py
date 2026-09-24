@@ -199,10 +199,11 @@ _MAP_HEIGHT_MAX_SHORT = 280
 _INSPECTOR_WIDTH_FRACTION = 0.24
 
 _RAW_FILTER = "Raw data (*.dat);;All files (*)"
-_CACHE_FILTER = "UV cache (*.uv.h5 *.h5);;All files (*)"
+# The cache patterns match is_cache_file (session.py): *.uv.h5, *.h5, *.hdf5
+_CACHE_FILTER = "UV cache (*.uv.h5 *.h5 *.hdf5);;All files (*)"
 _ANY_FILTER = (
-    "Raw data or UV cache (*.dat *.uv.h5 *.h5);;Raw data (*.dat);;UV cache (*.uv.h5 *.h5);;"
-    "All files (*)"
+    "Raw data or UV cache (*.dat *.uv.h5 *.h5 *.hdf5);;Raw data (*.dat);;"
+    "UV cache (*.uv.h5 *.h5 *.hdf5);;All files (*)"
 )
 _TEC_FILTER = "RadialAnalysis ellipse file (*.tec);;All files (*)"
 _BUSY_TIP = "Wait for the running operation to finish"
