@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Tool caches
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.pytest_cache/
+
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Scratch and outputs
+.scratch/
+/out/
+*.log
+
+# Data and caches (raw acquisitions, UV caches and their in-progress builds)
+*.dat
+*.h5
+*.h5.tmp
+*.hdf5
+*.uvd
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code local state
+.claude/

@@ -1,0 +1,176 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uvcorr"
+dynamic = ["version"]
+description = "RENA-3 fine-timing U/V ellipse correction from raw PET acquisition files"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["PET", "detector", "CZT", "RENA-3", "timing", "ellipse"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+
+# adc2kev is not on PyPI: install it editable from ~/adc2kev-python first (see README).
+dependencies = [
+    "adc2kev>=2.2.7",
+    "numpy>=1.24.0,<2.0",
+    "scipy>=1.10.0",
+    "h5py>=3.8.0",
+    "PyQt6>=6.5.0",
+    "pyqtgraph>=0.13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "pytest-cov>=7.0",
+    "pytest-qt>=4.5",
+    "black>=25.12.0,<26.0",
+    "ruff>=0.14.0,<0.15",
+    "mypy>=1.19.0,<2.0",
+]
+
+[project.scripts]
+uvcorr = "uvcorr.cli:main"
+uvcorr-gui = "uvcorr.gui.main:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "uvcorr.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+uvcorr = ["py.typed"]
+
+# Black code formatter
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | venv
+  | build
+  | dist
+)/
+'''
+
+# Ruff linter
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "ARG", # flake8-unused-arguments
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",  # line too long (handled by black)
+    "B008",  # do not perform function calls in argument defaults
+    "B905",  # zip without explicit strict parameter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # unused imports in __init__.py
+"tests/**/*.py" = ["ARG"]  # unused arguments in tests
+
+# MyPy type checker (same flags as adc2kev)
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+strict_equality = true
+extra_checks = true  # replaces the deprecated strict_concatenate used by adc2kev
+
+# Third-party packages without usable type information. adc2kev itself ships
+# py.typed and is found through its editable-install .pth path, so it needs no
+# override.
+[[tool.mypy.overrides]]
+module = [
+    "pyqtgraph.*",
+    "PyQt6.*",
+    "h5py.*",
+    "scipy.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "uvcorr.gui.*",
+]
+# PyQt6 classes appear as Any due to incomplete stubs
+disable_error_code = ["misc"]
+
+# Pytest
+[tool.pytest.ini_options]
+minversion = "9.0"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+qt_api = "pyqt6"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "gui: marks tests requiring GUI (pytest-qt; run offscreen by default)",
+    "realdata: marks tests requiring the real test .dat file or its UV cache",
+]
+
+# Coverage
+[tool.coverage.run]
+source = ["uvcorr"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+]
+
+[tool.coverage.report]
+precision = 2
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]
