@@ -22,7 +22,7 @@ DEFAULTS = {
     "phase_ref_freq_hz": 490e3,
     "high_rejection_frac": 0.05,
     "extreme_axis_ratio": 0.5,
-    "broad_ring_frac": 0.1,
+    "broad_ring_frac": 0.05,
 }
 
 
@@ -199,7 +199,7 @@ class TestFitOptionsJson:
         assert FitOptions().to_json() == (
             '{"min_events":100,"robust":true,"clip_k":4.0,"max_iter":5,"geometric":false,'
             '"phase_ref_freq_hz":490000.0,"high_rejection_frac":0.05,"extreme_axis_ratio":0.5,'
-            '"broad_ring_frac":0.1}'
+            '"broad_ring_frac":0.05}'
         )
 
     def test_missing_keys_take_defaults(self) -> None:

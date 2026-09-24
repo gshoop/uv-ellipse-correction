@@ -779,7 +779,7 @@ class TestFitEllipse:
         assert FLAG_BROAD_RING not in fit_ellipse(u, v).flags
         assert FLAG_BROAD_RING not in fit_ellipse(u, v, FitOptions(broad_ring_frac=0.02)).flags
         assert FLAG_BROAD_RING in fit_ellipse(u, v, FitOptions(broad_ring_frac=0.005)).flags
-        # A thick ring: sigma 90 on R ~ 590 gives ~0.15 > 0.1.
+        # A thick ring: sigma 90 on R ~ 590 gives ~0.15 > 0.05.
         u, v, _ = make_channel(CASES[0].params, 5000, 90.0)
         assert FLAG_BROAD_RING in fit_ellipse(u, v).flags
 
@@ -1098,3 +1098,29 @@ class TestResiduals:
         ua = (x - p.cx) * c + (y - p.cy) * s
         va = -(x - p.cx) * s + (y - p.cy) * c
         np.testing.assert_allclose((ua / p.a) ** 2 + (va / p.b) ** 2, 1.0, rtol=1e-12)
+
+
+@pytest.mark.parametrize(("width", "flagged"), [(30.0, False), (60.0, True)])
+def test_broad_ring_boundary_on_box_rings(width: float, flagged: bool) -> None:
+    # Self-contained: a real-like ring (b/a 0.966, sqrt(ab) ~ 432 ADC) with a flat-topped,
+    # box-shaped radial profile of full width `width`, as on the broad nodes of the test file.
+    # The flag's metric is 1.4826 * MAD / sqrt(ab) = 1.4826 * width / 4 / 432: 0.026 for a
+    # 30-ADC box (the widest real rings are ~0.029) and 0.051 for a 60-ADC box, just above
+    # the default broad_ring_frac of 0.05.
+    rng = np.random.default_rng(2026)
+    n, a, b, phi, cx, cy = 20_000, 440.0, 425.0, 0.3, 2040.0, 2030.0
+    t = rng.uniform(0.0, 2.0 * math.pi, n)
+    ex, ey = a * np.cos(t), b * np.sin(t)
+    x = ex * math.cos(phi) - ey * math.sin(phi)
+    y = ex * math.sin(phi) + ey * math.cos(phi)
+    scale = 1.0 + rng.uniform(-width / 2.0, width / 2.0, n) / np.hypot(x, y)
+    u = np.rint(cx + x * scale).astype(np.int16)
+    v = np.rint(cy + y * scale).astype(np.int16)
+    fit = fit_ellipse(u, v)
+    assert fit.ok and fit.params is not None and fit.n_rejected == 0
+    res = residual_to_ellipse(u, v, fit.params)
+    spread = 1.4826 * float(np.median(np.abs(res - np.median(res))))
+    expected = 1.4826 * width / 4.0 / fit.params.target_radius
+    assert spread / fit.params.target_radius == pytest.approx(expected, rel=0.03)
+    assert (FLAG_BROAD_RING in fit.flags) == flagged
+    assert FitOptions().broad_ring_frac == 0.05

@@ -150,7 +150,9 @@ class FitOptions:
         broad_ring_frac: Robust radial spread of the kept points
             (``1.4826 * MAD`` of their residuals to the ellipse), relative to
             ``sqrt(ab)``, above which the ``broad_ring`` flag is set. Finite
-            and positive. Real rings are about 0.017.
+            and positive. On the full test acquisition real rings are 0.002
+            to 0.0288 and blobs and other non-rings 0.0759 and up, with no
+            channel in between (phase 3 census, docs/ALGORITHM.md).
 
     Example:
         >>> opts = FitOptions(robust=False)
@@ -168,7 +170,7 @@ class FitOptions:
     phase_ref_freq_hz: float = 490e3
     high_rejection_frac: float = 0.05
     extreme_axis_ratio: float = 0.5
-    broad_ring_frac: float = 0.1
+    broad_ring_frac: float = 0.05
 
     def __post_init__(self) -> None:
         """Validate and normalise the field types.

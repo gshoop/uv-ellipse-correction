@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import hashlib
+import json
 import logging
 import os
 import pickle
@@ -25,6 +26,7 @@ from adc2kev.parser import PacketParser
 from tests.conftest import SYNTHETIC_BOARDS, SYNTHETIC_NODES, SyntheticFile
 from tests.synthetic_dat import Frame, Hit, crc8, encode_frame, expected_events, write_dat
 from uvcorr import __version__, cache
+from uvcorr.analysis import CSV_COLUMNS, ChannelKey, ChannelResult
 from uvcorr.cache import (
     EVENT_FIELDS,
     UV_CACHE_VERSION,
@@ -33,13 +35,16 @@ from uvcorr.cache import (
     CacheBuildError,
     CacheBusyError,
     InsufficientDiskSpaceError,
+    ResultsError,
     UVCache,
     compute_source_hash,
     default_cache_path,
     estimate_cache_bytes,
+    merge_results,
     open_or_build,
 )
 from uvcorr.channels import active_channel_mask
+from uvcorr.options import FitOptions
 
 # Small thresholds so a ~12k-event file goes through many batches and every
 # flushing path (global budget, per-board limit, partial chunks).
@@ -1055,3 +1060,361 @@ class TestBuildChecks:
         assert stats.n_events_uv_zero == 2
         assert uv.metadata()["n_events_uv_zero"] == 2
         assert uv.channel_data(2, 16, 1, 7)[0].tolist() == [0]
+
+
+# ----------------------------------------------------------------------
+# Results (/results/current and overrides)
+# ----------------------------------------------------------------------
+
+
+def _result(key: tuple[int, int, int, int], status: str = "ok", **values: Any) -> ChannelResult:
+    node, board, rena, channel = key
+    base: dict[str, Any] = {
+        "node": node,
+        "board": board,
+        "rena": rena,
+        "channel": channel,
+        "polarity": "anode",
+        "electrode": f"A{channel:02d}",
+        "status": status,
+        "flags": (),
+        "n_events": 500 + channel,
+    }
+    if status == "ok":
+        base.update(
+            n_used=490,
+            n_rejected=10 + channel,
+            centerU=2000.123456789012 + channel,
+            centerV=2050.5,
+            semiMajor=600.25,
+            semiMinor=585.125,
+            phi=-0.3,
+            axis_ratio=585.125 / 600.25,
+            target_radius=592.63,
+            pre_mean=592.0,
+            pre_sigma=8.5,
+            pre_chi2ndf=None,  # e.g. a failed pre Gaussian
+            post_sigma=6.0 + channel / 100,
+            phase_ks=0.01,
+            flags=("gauss_fit_failed_pre", "high_rejection"),
+        )
+    base.update(values)
+    return ChannelResult(**base)
+
+
+BATCH = [
+    _result((1, 16, 1, 25)),
+    _result((1, 15, 0, 5)),
+    _result((1, 15, 0, 6), status="too_few_events", n_events=3),
+    _result((2, 15, 1, 7), status="fit_failed"),
+]
+REFIT = FitOptions(robust=False, clip_k=3.0)
+
+
+class TestResults:
+    def test_no_results(self, built: UVCache, tmp_path: Path) -> None:
+        assert built.load_results() is None
+        assert built.merged_results() == []
+        assert UVCache(tmp_path / "missing.uv.h5").load_results() is None
+        assert built.delete_override((1, 15, 0, 5)) is False
+        assert built.clear_overrides() == 0
+
+    def test_save_load_round_trip(self, built: UVCache) -> None:
+        options = FitOptions(max_iter=3, geometric=True)
+        built.save_results(BATCH, options)
+        assert built.has_results()
+        stored = built.load_results()
+        assert stored is not None
+        assert list(stored.results) == sorted(BATCH, key=lambda r: r.key)
+        assert stored.options == options
+        assert stored.uvcorr_version == __version__
+        assert stored.created_at and stored.overrides == {}
+        assert stored.merged() == list(stored.results) == built.merged_results()
+        ok = stored.results[0]
+        assert ok.pre_chi2ndf is None and ok.post_mean is None and ok.phase_ks == 0.01
+        assert ok.centerU == 2000.123456789012 + 5  # float64, exact
+        assert ok.flags == ("high_rejection", "gauss_fit_failed_pre")
+        failed = next(r for r in stored.results if r.status == "fit_failed")
+        assert failed.n_used is None and failed.n_rejected is None and failed.centerU is None
+
+    def test_table_layout(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        with h5py.File(built.path, "r") as h5f:
+            current = h5f["results/current"]
+            assert set(current.attrs) >= {"options_json", "created_at", "uvcorr_version"}
+            assert FitOptions.from_json(current.attrs["options_json"]) == FitOptions()
+            table = current["table"]
+            assert table.dtype.names == CSV_COLUMNS
+            assert h5py.check_string_dtype(table.dtype["flags"]) is not None
+            assert h5py.check_string_dtype(table.dtype["electrode"]) is not None
+            assert table.dtype["n_used"] == np.int64 and table.dtype["phi"] == np.float64
+            rows = table[()]  # sorted by key: (1,15,0,5), (1,15,0,6), ...
+            assert rows["flags"][0] == b"high_rejection;gauss_fit_failed_pre"
+            assert rows["electrode"][0] == b"A05"
+            assert rows["n_used"][1] == -1  # too_few_events: None -> -1
+            assert np.isnan(rows["centerU"][1])
+            assert rows["flags"][1] == b""
+            assert set(h5f["results"]) == {"current"}
+
+    def test_save_validation(self, built: UVCache) -> None:
+        with pytest.raises(ValueError, match="Duplicate"):
+            built.save_results([BATCH[0], BATCH[0]], FitOptions())
+        override = dataclasses.replace(BATCH[0], options_source="override")
+        with pytest.raises(ValueError, match="save_override"):
+            built.save_results([override], FitOptions())
+        assert built.load_results() is None
+
+    def test_empty_results(self, built: UVCache) -> None:
+        built.save_results([], FitOptions())
+        stored = built.load_results()
+        assert stored is not None and stored.results == () and stored.merged() == []
+
+    def test_save_does_not_create_a_file(self, tmp_path: Path) -> None:
+        missing = UVCache(tmp_path / "missing.uv.h5")
+        with pytest.raises(OSError):
+            missing.save_results(BATCH, FitOptions())
+        with pytest.raises(OSError):
+            missing.save_override(BATCH[0], REFIT)
+        assert not missing.exists()
+
+    def test_override_needs_batch_results(self, built: UVCache) -> None:
+        with pytest.raises(ResultsError, match="run a batch"):
+            built.save_override(BATCH[0], REFIT)
+
+    def test_override_upsert_merge_delete_clear(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        refit = dataclasses.replace(BATCH[1], post_sigma=4.5, n_rejected=0, flags=())
+        built.save_override(refit, REFIT)
+        refit2 = dataclasses.replace(refit, post_sigma=4.25)
+        built.save_override(refit2, REFIT)  # upsert: same key
+        extra = _result((9, 30, 1, 28))  # a channel without a batch row
+        built.save_override(extra, FitOptions(min_events=10))
+        stored = built.load_results()
+        assert stored is not None
+        assert list(stored.overrides) == [(1, 15, 0, 5), (9, 30, 1, 28)]
+        ov = stored.overrides[ChannelKey(1, 15, 0, 5)]
+        assert ov.options == REFIT
+        assert ov.result.options_source == "override" and ov.result.post_sigma == 4.25
+        assert stored.overrides[ChannelKey(9, 30, 1, 28)].options == FitOptions(min_events=10)
+        assert len(stored.results) == len(BATCH)  # batch rows untouched
+
+        merged = built.merged_results()
+        assert [r.key for r in merged] == sorted([*(r.key for r in BATCH), extra.key])
+        by_key = {r.key: r for r in merged}
+        assert by_key[(1, 15, 0, 5)].post_sigma == 4.25
+        assert by_key[(1, 15, 0, 5)].options_source == "override"
+        assert by_key[(1, 16, 1, 25)].options_source == "batch"
+
+        assert built.delete_override(ChannelKey(9, 30, 1, 28)) is True
+        assert built.delete_override((9, 30, 1, 28)) is False
+        assert built.merged_results()[0].options_source == "override"
+        assert built.clear_overrides() == 1
+        assert built.clear_overrides() == 0
+        stored = built.load_results()
+        assert stored is not None and stored.overrides == {}
+        assert built.merged_results() == list(stored.results)
+
+    def test_overrides_are_kept_across_batch_runs(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_override(dataclasses.replace(BATCH[1], post_sigma=4.5), REFIT)
+        new_batch = [dataclasses.replace(r, n_events=r.n_events + 1) for r in BATCH]
+        built.save_results(new_batch, FitOptions(clip_k=5.0))
+        stored = built.load_results()
+        assert stored is not None
+        assert stored.options == FitOptions(clip_k=5.0)
+        assert list(stored.results) == sorted(new_batch, key=lambda r: r.key)
+        assert list(stored.overrides) == [(1, 15, 0, 5)]
+        assert stored.overrides[ChannelKey(1, 15, 0, 5)].result.post_sigma == 4.5
+
+        built.save_results(new_batch, FitOptions(), keep_overrides=False)
+        stored = built.load_results()
+        assert stored is not None and stored.overrides == {}
+
+    def test_failure_midway_keeps_previous_results(
+        self, built: UVCache, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_override(dataclasses.replace(BATCH[1], post_sigma=4.5), REFIT)
+        before = built.load_results()
+
+        def boom(*_args: Any) -> None:
+            raise RuntimeError("disk trouble")
+
+        monkeypatch.setattr(cache, "_copy_overrides", boom)
+        with pytest.raises(RuntimeError, match="disk trouble"):
+            built.save_results(BATCH[:1], FitOptions(clip_k=2.0))
+        assert built.load_results() == before
+        with h5py.File(built.path, "r") as h5f:
+            assert set(h5f["results"]) == {"current"}
+
+    def test_interrupted_swap_is_recovered(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_override(dataclasses.replace(BATCH[1], post_sigma=4.5), REFIT)
+        before = built.load_results()
+        # Simulate a crash between "current -> _old" and "_new -> current", with a
+        # half-written _new and an interrupted overrides swap (only table_new left).
+        with h5py.File(built.path, "r+") as h5f:
+            results = h5f["results"]
+            results.move("current", "_old")
+            results.create_group("_new").attrs["options_json"] = "{"
+            results.move("_old/overrides/table", "_old/overrides/table_new")
+        assert built.load_results() == before
+        built.save_override(dataclasses.replace(BATCH[0], post_sigma=3.0), REFIT)
+        stored = built.load_results()
+        assert stored is not None and len(stored.overrides) == 2
+        with h5py.File(built.path, "r") as h5f:
+            assert set(h5f["results"]) == {"current"}
+            assert set(h5f["results/current/overrides"]) == {"table"}
+        built.save_results(BATCH, FitOptions())
+        stored = built.load_results()
+        assert stored is not None and len(stored.overrides) == 2
+
+    @pytest.mark.parametrize("operation", ["delete", "clear"])
+    def test_override_removal_recovers_an_interrupted_swap(
+        self, built: UVCache, operation: str
+    ) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_override(dataclasses.replace(BATCH[1], post_sigma=4.5), REFIT)
+        with h5py.File(built.path, "r+") as h5f:
+            h5f["results"].move("current", "_old")
+        if operation == "delete":
+            assert built.delete_override(BATCH[1].key) is True
+        else:
+            assert built.clear_overrides() == 1
+        with h5py.File(built.path, "r") as h5f:
+            assert set(h5f["results"]) == {"current"}
+        stored = built.load_results()
+        assert stored is not None and stored.overrides == {} and len(stored.results) == 4
+
+    def test_newer_results_still_load(
+        self, built: UVCache, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        built.save_results(BATCH, FitOptions(clip_k=3.5))
+        with h5py.File(built.path, "r+") as h5f:
+            current = h5f["results/current"]
+            data = FitOptions(clip_k=3.5).to_dict() | {"future_option": 1}
+            current.attrs["options_json"] = json.dumps(data)
+            # A newer table: an extra column, and an optional column missing
+            table = current["table"][()]
+            names = [n for n in table.dtype.names if n != "phase_ks"]
+            fields = [(n, table.dtype[n]) for n in names] + [("future_metric", np.float64)]
+            newer = np.zeros(len(table), dtype=fields)
+            for name in names:
+                newer[name] = table[name]
+            del current["table"]
+            current.create_dataset("table", data=newer)
+        with caplog.at_level(logging.WARNING):
+            stored = built.load_results()
+        assert stored is not None
+        assert stored.options == FitOptions(clip_k=3.5)
+        assert "future_option" in caplog.text
+        assert all(r.phase_ks is None for r in stored.results)
+        assert [r.key for r in stored.results] == sorted(r.key for r in BATCH)
+
+    def test_cleanup_after_the_commit_point_is_best_effort(
+        self, built: UVCache, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        built.save_results(BATCH, FitOptions())
+        real_delitem = h5py.Group.__delitem__
+        real_move = h5py.Group.move
+
+        def failing_delitem(self: Any, name: str) -> None:
+            if name == "_old":
+                raise OSError("simulated HDF5 error")
+            real_delitem(self, name)
+
+        def failing_move(self: Any, source: str, dest: str) -> None:
+            if source == "table_new":
+                raise OSError("simulated HDF5 error")
+            real_move(self, source, dest)
+
+        monkeypatch.setattr(h5py.Group, "__delitem__", failing_delitem)
+        monkeypatch.setattr(h5py.Group, "move", failing_move)
+        new_batch = [dataclasses.replace(r, n_events=r.n_events + 7) for r in BATCH]
+        with caplog.at_level(logging.WARNING):
+            built.save_results(new_batch, FitOptions(clip_k=3.0))  # committed: no error
+            built.save_override(dataclasses.replace(BATCH[1], post_sigma=4.5), REFIT)
+        assert "_old" in caplog.text and "overrides table" in caplog.text
+        stored = built.load_results()
+        assert stored is not None and stored.options == FitOptions(clip_k=3.0)
+        assert list(stored.results) == sorted(new_batch, key=lambda r: r.key)
+        assert stored.overrides[BATCH[1].key].result.post_sigma == 4.5  # read from table_new
+        with h5py.File(built.path, "r") as h5f:
+            assert set(h5f["results"]) == {"current", "_old"}
+            assert set(h5f["results/current/overrides"]) == {"table_new"}
+
+        monkeypatch.undo()  # the next writes clean the leftovers up
+        built.save_override(dataclasses.replace(BATCH[0], post_sigma=3.0), REFIT)
+        built.save_results(new_batch, FitOptions(clip_k=3.0))
+        with h5py.File(built.path, "r") as h5f:
+            assert set(h5f["results"]) == {"current"}
+            assert set(h5f["results/current/overrides"]) == {"table"}
+        stored = built.load_results()
+        assert stored is not None and len(stored.overrides) == 2
+
+    def test_unknown_flags_and_statuses_from_a_newer_version(
+        self, built: UVCache, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_override(BATCH[1], REFIT)
+        with h5py.File(built.path, "r+") as h5f:
+            for path in ("results/current/table", "results/current/overrides/table"):
+                table = h5f[path][()]
+                table["flags"][0] = "high_rejection;future_flag"
+                if path.endswith("current/table"):
+                    table["status"][1] = "future_status"
+                    table["polarity"][2] = "future_polarity"
+                del h5f[path]
+                h5f.create_dataset(path, data=table)
+        with caplog.at_level(logging.WARNING):
+            stored = built.load_results()
+        assert stored is not None
+        assert "future_flag" in caplog.text
+        assert "Skipping 2 stored result row(s)" in caplog.text and "future_status" in caplog.text
+        keys = sorted(r.key for r in BATCH)
+        assert [r.key for r in stored.results] == [keys[0], keys[3]]
+        assert stored.results[0].flags == ("high_rejection",)
+        assert stored.overrides[BATCH[1].key].result.flags == ("high_rejection",)
+
+    def test_unreadable_results(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        with h5py.File(built.path, "r+") as h5f:
+            h5f["results/current"].attrs["options_json"] = "not json"
+        with pytest.raises(ResultsError, match="unreadable"):
+            built.load_results()
+
+    def test_busy_cache(
+        self,
+        built: UVCache,
+        hold_h5_open: HoldOpen,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(cache, "LOCK_RETRY_SECONDS", 0.2)
+        with hold_h5_open(built.path):
+            with pytest.raises(CacheBusyError):
+                built.save_results(BATCH, FitOptions())
+            with pytest.raises(CacheBusyError):
+                built.load_results()
+        # The holder left a /results/current group without a table: no results
+        assert built.load_results() is None
+        built.save_results(BATCH, FitOptions())
+        assert built.load_results() is not None
+
+    def test_rebuild_discards_results(self, built: UVCache, synthetic_file: SyntheticFile) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_override(BATCH[1], REFIT)
+        open_or_build(synthetic_file.path, built.path, force=True)
+        assert built.load_results() is None and not built.has_results()
+
+    def test_merge_results_helper(self) -> None:
+        override = dataclasses.replace(BATCH[1], post_sigma=1.0)
+        merged = merge_results(BATCH, [override])
+        assert [r.key for r in merged] == sorted(r.key for r in BATCH)
+        assert {r.key: r.options_source for r in merged}[override.key] == "override"
+        assert merge_results([], []) == []
+
+    def test_stored_results_pickle(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_override(BATCH[1], REFIT)
+        stored = built.load_results()
+        assert pickle.loads(pickle.dumps(stored)) == stored

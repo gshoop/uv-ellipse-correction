@@ -60,16 +60,16 @@ test-cov:  ## Run tests with coverage (skip real-data tests)
 	$(PYTHON) -m pytest -m "not realdata" --cov=uvcorr --cov-report=term-missing --cov-report=html --cov-report=xml
 
 lint:  ## Run linter (ruff)
-	$(PYTHON) -m ruff check src/ tests/
+	$(PYTHON) -m ruff check src/ tests/ scripts/
 
 format:  ## Format code with black
-	$(PYTHON) -m black src/ tests/
+	$(PYTHON) -m black src/ tests/ scripts/
 
 format-check:  ## Check code formatting
-	$(PYTHON) -m black --check src/ tests/
+	$(PYTHON) -m black --check src/ tests/ scripts/
 
 type-check:  ## Run type checker (mypy)
-	$(PYTHON) -m mypy src/
+	$(PYTHON) -m mypy src/ scripts/
 
 clean:  ## Clean build artifacts and tool caches
 	rm -rf build/

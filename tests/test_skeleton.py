@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import re
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,7 @@ SKELETON_MODULES = [
     "uvcorr.io",
     "uvcorr.io.tec",
     "uvcorr.io.summary_csv",
+    "uvcorr.options",
     "uvcorr.cli",
     "uvcorr.gui",
     "uvcorr.gui.main",
@@ -49,10 +51,11 @@ def test_cli_requires_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
     assert "required" in capsys.readouterr().err
 
 
-def test_cli_process_not_implemented(capsys: pytest.CaptureFixture[str]) -> None:
-    # build-cache is implemented since phase 1 (tests/test_cli.py).
-    assert cli.main(["process", "data.dat", "--output-dir", "out"]) == cli.EXIT_NOT_IMPLEMENTED
-    assert "not implemented yet" in capsys.readouterr().err
+def test_cli_process_is_wired(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # build-cache (phase 1) and process (phase 3) are tested in tests/test_cli.py.
+    missing = tmp_path / "data.dat"
+    assert cli.main(["process", str(missing), "--output-dir", str(tmp_path)]) == cli.EXIT_USAGE
+    assert "not found" in capsys.readouterr().err
 
 
 def test_gui_entry_not_implemented(capsys: pytest.CaptureFixture[str]) -> None:

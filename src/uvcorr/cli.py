@@ -5,17 +5,27 @@ Subcommands (plan section 8):
 ``uvcorr build-cache data.dat [--cache PATH] [--force]``
     Build (or reuse) the sibling HDF5 UV cache for a raw ``.dat`` file.
 
-``uvcorr process data.dat --output-dir out/ [...]``
-    Fit every active channel and write ``<stem>.tec`` and ``radial_summary.csv``.
-    Not implemented yet (phase 3); exits with status 1.
+``uvcorr process data.dat --output-dir out/ [--cache PATH] [--workers N]
+[--min-events N] [--no-robust] [--clip-k K] [--max-iter N] [--geometric]
+[--discard-overrides]``
+    Build or reuse the cache, fit every active channel (a process pool, one
+    task per board), write ``<dat stem>.tec`` and ``radial_summary.csv`` from
+    the batch results with the cache's per-channel GUI overrides applied
+    (unless ``--discard-overrides``), then store the results in the cache
+    (``/results/current``, keeping the overrides unless
+    ``--discard-overrides``; skipped with a warning if the cache file is
+    read-only). The output directory is created and write-tested before the
+    analysis starts. Prints a status/flag census and timings. Options that
+    are not given keep their ``FitOptions`` defaults.
 
-Exit codes: 0 on success, 1 on an error (e.g. a failed build, an unusable
-cache path, a cache in use by another process, or too little disk space), 2
-for a missing input file or bad arguments, 130 when the build was stopped with
-Ctrl-C. Ctrl-C during a build sets the build's stop flag: the build stops at
-its next check (within one parser batch), removes its temporary file and
-leaves any previous cache untouched; further Ctrl-Cs are ignored until that
-cleanup has finished.
+Exit codes: 0 on success, 1 on an error (e.g. a failed build or analysis, an
+unusable cache path, a cache in use by another process, or too little disk
+space), 2 for a missing input file or bad arguments, 130 when stopped with
+Ctrl-C. Ctrl-C during a build or an analysis sets its stop flag: a build stops
+at its next check (within one parser batch), removes its temporary file and
+leaves any previous cache untouched; an analysis stops its workers at their
+next channel, and nothing is stored or written. Further Ctrl-Cs are ignored
+until that cleanup has finished.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import signal
 import sys
 import threading
@@ -34,19 +45,31 @@ from types import FrameType
 from typing import Any, TextIO
 
 from uvcorr import __version__
+from uvcorr.analysis import (
+    MAX_DEFAULT_WORKERS,
+    AnalysisCancelled,
+    AnalysisError,
+    ChannelResult,
+    analyze_all,
+    default_workers,
+)
 from uvcorr.cache import (
     USER_WARNING,
     CacheBuildCancelled,
+    ResultsError,
     UVCache,
     UVCacheError,
     default_cache_path,
+    merge_results,
 )
+from uvcorr.ellipse import MIN_FIT_POINTS
+from uvcorr.io.export import prepare_output_dir, write_outputs
+from uvcorr.options import FLAGS, STATUSES, FitOptions
 
 logger = logging.getLogger(__name__)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
-EXIT_NOT_IMPLEMENTED = 1
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
@@ -59,6 +82,22 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from exc
     if number < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {number}")
+    return number
+
+
+def _min_events(value: str) -> int:
+    """argparse type for ``--min-events``: an int >= ``MIN_FIT_POINTS`` (6).
+
+    ``FitOptions`` accepts any ``min_events >= 1``, but below 6 points the
+    algebraic fit cannot run, so channels with 1-5 events would be reported
+    ``fit_failed`` instead of ``too_few_events``; the CLI refuses such values.
+    """
+    number = _positive_int(value)
+    if number < MIN_FIT_POINTS:
+        raise argparse.ArgumentTypeError(
+            f"must be >= {MIN_FIT_POINTS} (the ellipse fit needs {MIN_FIT_POINTS} points), "
+            f"got {number}"
+        )
     return number
 
 
@@ -109,10 +148,11 @@ def _add_build_cache_parser(
 
 
 def _add_process_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    """Register the ``process`` subcommand."""
+    """Register the ``process`` subcommand (defaults in the help come from ``FitOptions``)."""
+    defaults = FitOptions()
     p = subparsers.add_parser(
         "process",
-        help="Fit all channels and export .tec + radial_summary.csv (not implemented yet).",
+        help="Fit all channels and export .tec + radial_summary.csv.",
         description=(
             "Build or reuse the UV cache, fit every active channel, and write "
             "<stem>.tec and radial_summary.csv to the output directory."
@@ -127,13 +167,15 @@ def _add_process_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         "--workers",
         type=_positive_int,
         default=None,
-        help="Worker processes (default: min(8, CPU count)).",
+        help=f"Worker processes (default: min({MAX_DEFAULT_WORKERS}, usable CPUs), "
+        f"here {default_workers()}).",
     )
     p.add_argument(
         "--min-events",
-        type=_positive_int,
+        type=_min_events,
         default=None,
-        help="Minimum events for a channel to be fitted (default: 100).",
+        help=f"Minimum events for a channel to be fitted, >= {MIN_FIT_POINTS} "
+        f"(default: {defaults.min_events}).",
     )
     p.add_argument(
         "--no-robust", action="store_true", help="Disable the robust (MAD-clipped) refit."
@@ -142,26 +184,23 @@ def _add_process_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         "--clip-k",
         type=_positive_float,
         default=None,
-        help="Robust clipping threshold in robust sigmas (default: 4).",
+        help=f"Robust clipping threshold in robust sigmas (default: {defaults.clip_k:g}).",
     )
     p.add_argument(
         "--max-iter",
         type=_positive_int,
         default=None,
-        help="Maximum robust refit iterations (default: 5).",
+        help=f"Maximum robust refit iterations (default: {defaults.max_iter}).",
     )
     p.add_argument(
         "--geometric", action="store_true", help="Refine with a geometric least-squares fit."
     )
-    p.set_defaults(func=_run_process)
-
-
-def _not_implemented(command: str, phase: int) -> int:
-    print(
-        f"uvcorr {command}: not implemented yet (planned for phase {phase}).",
-        file=sys.stderr,
+    p.add_argument(
+        "--discard-overrides",
+        action="store_true",
+        help="Drop the per-channel overrides stored in the cache (default: keep and apply them).",
     )
-    return EXIT_NOT_IMPLEMENTED
+    p.set_defaults(func=_run_process)
 
 
 class _ProgressPrinter:
@@ -199,13 +238,14 @@ class _ProgressPrinter:
 
 
 @contextmanager
-def _sigint_sets(stop: threading.Event) -> Iterator[None]:
+def _sigint_sets(stop: threading.Event, what: str = "the build") -> Iterator[None]:
     """While active, Ctrl-C sets ``stop`` instead of raising KeyboardInterrupt.
 
     The previous handler is restored only when the block exits, i.e. after
-    the build has stopped and cleaned up, so no KeyboardInterrupt can land in
-    the middle of that cleanup. Only installed in the main thread
-    (``signal.signal`` fails elsewhere).
+    the build (or analysis) has stopped and cleaned up, so no
+    KeyboardInterrupt can land in the middle of that cleanup. Only installed
+    in the main thread (``signal.signal`` fails elsewhere). ``what`` names the
+    operation in the messages.
     """
     if threading.current_thread() is not threading.main_thread():
         yield
@@ -213,10 +253,10 @@ def _sigint_sets(stop: threading.Event) -> Iterator[None]:
 
     def handler(_signum: int, _frame: FrameType | None) -> None:
         if stop.is_set():
-            print("\nstill stopping the build...", file=sys.stderr, flush=True)
+            print(f"\nstill stopping {what}...", file=sys.stderr, flush=True)
             return
         stop.set()
-        print("\nstopping the build...", file=sys.stderr, flush=True)
+        print(f"\nstopping {what}...", file=sys.stderr, flush=True)
 
     previous = signal.signal(signal.SIGINT, handler)
     try:
@@ -346,9 +386,179 @@ def _build_with_progress(cache: UVCache, dat: Path, *, force: bool) -> None:
         progress.close()
 
 
+def _fit_options(args: argparse.Namespace) -> FitOptions:
+    """``FitOptions`` from the defaults plus the options given on the command line."""
+    given: dict[str, Any] = {}
+    if args.min_events is not None:
+        given["min_events"] = args.min_events
+    if args.no_robust:
+        given["robust"] = False
+    if args.clip_k is not None:
+        given["clip_k"] = args.clip_k
+    if args.max_iter is not None:
+        given["max_iter"] = args.max_iter
+    if args.geometric:
+        given["geometric"] = True
+    return FitOptions(**given)
+
+
+def _describe_options(options: FitOptions) -> str:
+    """``defaults`` or the non-default options as ``name=value``."""
+    defaults = FitOptions().to_dict()
+    changed = [f"{k}={v}" for k, v in options.to_dict().items() if defaults[k] != v]
+    return ", ".join(changed) if changed else "defaults"
+
+
 def _run_process(args: argparse.Namespace) -> int:
-    """Run ``uvcorr process`` (phase 3)."""
-    return _not_implemented(args.command, phase=3)
+    """Run ``uvcorr process``: cache, fit all channels, export, store, census.
+
+    Everything that can be checked cheaply is checked before the analysis: the
+    output directory is created and write-tested, the stored overrides are
+    read, and a read-only cache is detected (the run then still writes the
+    outputs but does not store the results). The outputs are written before
+    the results are stored, so a failure to store never loses the outputs.
+    """
+    dat: Path = args.dat
+    if not dat.is_file():
+        print(f"error: raw data file not found: {dat}", file=sys.stderr)
+        return EXIT_USAGE
+    output_dir: Path = args.output_dir
+    if output_dir.exists() and not output_dir.is_dir():
+        print(f"error: --output-dir {output_dir} exists and is not a directory", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        options = _fit_options(args)
+    except (TypeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    cache = UVCache(args.cache if args.cache is not None else default_cache_path(dat))
+
+    t_start = time.perf_counter()
+    try:
+        prepare_output_dir(output_dir, dat.stem)
+        with _cli_reports_user_warnings():
+            reused = cache.is_valid_for(dat)
+            if not reused:
+                _build_with_progress(cache, dat, force=False)
+        t_cache = time.perf_counter()
+
+        store = os.access(cache.path, os.W_OK)
+        if not store:
+            print(
+                f"warning: the UV cache {cache.path} is read-only: the results will not be "
+                "stored in it (the output files are still written)",
+                file=sys.stderr,
+            )
+        overrides: list[ChannelResult] = []
+        if not args.discard_overrides:
+            stored = cache.load_results()
+            if stored is not None:
+                overrides = [override.result for override in stored.overrides.values()]
+
+        n_boards = len(cache.board_event_counts())
+        workers = min(args.workers or default_workers(), max(n_boards, 1))
+        print(
+            f"Fitting {n_boards} boards with {workers} worker(s), options: "
+            f"{_describe_options(options)}",
+            file=sys.stderr,
+        )
+        results = _analyze_with_progress(cache, options, workers)
+        t_analysis = time.perf_counter()
+
+        merged = merge_results(results, overrides)
+        tec_path, csv_path = write_outputs(output_dir, dat.stem, merged)
+        t_write = time.perf_counter()
+    except CacheBuildCancelled:
+        print("build cancelled; no new cache was written.", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    except AnalysisCancelled:
+        print("analysis cancelled; nothing was stored or written.", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    except ResultsError as exc:
+        print(f"error: {exc} (--discard-overrides skips and replaces them)", file=sys.stderr)
+        return EXIT_ERROR
+    except (AnalysisError, UVCacheError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    store_error: Exception | None = None
+    if store:
+        try:
+            cache.save_results(results, options, keep_overrides=not args.discard_overrides)
+        except (UVCacheError, OSError, ValueError) as exc:
+            store_error = exc
+    t_store = time.perf_counter()
+
+    status = "reused" if reused else "built"
+    print(f"UV cache: {cache.path} ({status})")
+    _print_census(merged, n_boards, workers, options, len(overrides), args.discard_overrides)
+    n_ok = sum(1 for r in merged if r.ok)
+    print("Outputs:")
+    print(f"  {tec_path}  ({n_ok:,} channel blocks, {_format_bytes(tec_path.stat().st_size)})")
+    print(f"  {csv_path}  ({len(merged):,} rows, {_format_bytes(csv_path.stat().st_size)})")
+    if store and store_error is None:
+        print("  results stored in the cache (/results/current)")
+    else:
+        print("  results NOT stored in the cache")
+    print(
+        f"Time: cache {t_cache - t_start:.1f} s, analysis {t_analysis - t_cache:.1f} s, "
+        f"write {t_write - t_analysis:.1f} s, store {t_store - t_write:.1f} s, "
+        f"total {t_store - t_start:.1f} s"
+    )
+    if store_error is not None:
+        print(
+            "error: the output files were written, but storing the results in the cache "
+            f"failed: {store_error}",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+def _analyze_with_progress(
+    cache: UVCache, options: FitOptions, workers: int
+) -> list[ChannelResult]:
+    """Run ``analyze_all`` with stderr progress and Ctrl-C as stop flag."""
+    stop = threading.Event()
+    progress = _ProgressPrinter("fitting", sys.stderr)
+
+    def on_progress(done: int, total: int) -> None:
+        progress(done / total if total else 1.0)
+
+    try:
+        with _sigint_sets(stop, "the analysis"):
+            return analyze_all(
+                cache, options, workers=workers, progress_cb=on_progress, stop_flag=stop
+            )
+    finally:
+        progress.close()
+
+
+def _print_census(
+    results: list[ChannelResult],
+    n_boards: int,
+    workers: int,
+    options: FitOptions,
+    n_overrides: int,
+    discarded: bool,
+) -> None:
+    """Print the status/flag census of the exported (merged) results to stdout."""
+    n_events = sum(r.n_events for r in results)
+    print(
+        f"Analysis: {len(results):,} channels ({n_events:,} events) on {n_boards} boards, "
+        f"{workers} worker(s), options: {_describe_options(options)}"
+    )
+    statuses = {status: sum(1 for r in results if r.status == status) for status in STATUSES}
+    print("  status:     " + ", ".join(f"{s} {n:,}" for s, n in statuses.items()))
+    flag_counts = {flag: sum(1 for r in results if flag in r.flags) for flag in FLAGS}
+    flagged = sum(1 for r in results if r.flags)
+    flag_text = ", ".join(f"{f} {n:,}" for f, n in flag_counts.items() if n) or "none"
+    print(f"  flags:      {flag_text}")
+    print(f"              ({flagged:,} channels with at least one flag)")
+    if discarded:
+        print("  overrides:  discarded (--discard-overrides)")
+    else:
+        print(f"  overrides:  {n_overrides:,} applied")
 
 
 def main(argv: list[str] | None = None) -> int:

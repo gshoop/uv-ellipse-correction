@@ -1,6 +1,6 @@
 # UV Ellipse Correction from Raw Data: Plan
 
-**Status:** Phases 0-2 done (2026-09-24): skeleton; channels, UV cache and `uvcorr build-cache`; ellipse fit and metrics. Next: phase 3.
+**Status:** Phases 0-3 done (2026-09-24): skeleton; UV cache and `uvcorr build-cache`; ellipse fit and metrics; analysis, `.tec`/CSV export, `uvcorr process`, C++ cross-check and census (see `docs/ALGORITHM.md`). Next: phase 4.
 **Repository:** `/home/swuupii/uv-ellipse-correction` (git, branch `main`)
 **Package name:** `uvcorr` (confirmed). Console scripts: `uvcorr` (CLI), `uvcorr-gui`.
 
@@ -382,6 +382,11 @@ the overrides. The widgets talk only to that layer.
    Also look at the distributions of pre vs post σ and of the rejected fraction per channel class
    (anode/cathode, count decile). Retune the defaults in `FitOptions` if the census says so, and record the
    evidence in `docs/ALGORITHM.md`.
+   - **Result (phase 3):** `uvcorr process` takes ≈ 17 s from the cache (8 workers, peak PSS ≈ 1.9 GB). Status:
+     6,115 ok, 442 too_few_events, 0 fit_failed. Flags: gauss_fit_failed_pre 1,093 (informational: resolved
+     double-horned pre radii), high_rejection 128, broad_ring 106, gauss_fit_failed_post 15,
+     extreme_axis_ratio 9. Only `broad_ring_frac` was retuned (0.1 → 0.05). A second, concentric U/V
+     population (b/a ≈ 0.30, φ ≈ −44°) appears in ≈ 900 channels; the robust fit rejects it.
 5. **GUI:** pytest-qt smoke tests on a small synthetic cache (open, select a channel through the map,
    switch tabs, re-fit a channel with robust off, export, and check that the files exist). Then a
    manual spot check on the test file, with screenshots in `docs/images/`.

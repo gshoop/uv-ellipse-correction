@@ -25,6 +25,7 @@ dependencies = [
     "numpy>=1.24.0,<2.0",
     "scipy>=1.10.0",
     "h5py>=3.8.0",
+    "threadpoolctl>=3.1",
     "PyQt6>=6.5.0",
     "pyqtgraph>=0.13.0",
 ]
@@ -124,6 +125,7 @@ module = [
     "PyQt6.*",
     "h5py.*",
     "scipy.*",
+    "threadpoolctl",
 ]
 ignore_missing_imports = true
 

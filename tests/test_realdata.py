@@ -145,3 +145,53 @@ def test_independent_reparse_matches_cache(real_dat: Path, real_cache: UVCache) 
     np.testing.assert_array_equal(
         data.rena.astype(np.int16) * 64 + data.channel, np.concatenate(probe_ch)
     )
+
+
+@pytest.mark.slow
+def test_analyze_board_node1_board15(real_cache: UVCache) -> None:
+    """Sanity of a full analysis of one real board (plan 10.4 spot check)."""
+    from uvcorr.analysis import analyze_board
+
+    if (1, 15) not in real_cache.board_event_counts():
+        pytest.skip("node 1 board 15 not in this cache")
+    channels = real_cache.channels(1, 15)
+    results = analyze_board(real_cache, 1, 15)
+    assert [(r.rena, r.channel) for r in results] == [(r, c) for r, c, _ in channels]
+    assert [r.n_events for r in results] == [n for _, _, n in channels]
+    ok = [r for r in results if r.ok]
+    assert len(ok) >= 0.9 * len(results)
+    ratios = [r.axis_ratio for r in ok if r.axis_ratio is not None]
+    assert len(ratios) == len(ok)
+    assert 0.8 < float(np.median(ratios)) < 1.0
+    assert all(0.5 < ratio <= 1.0 for ratio in ratios)
+    radii = [r.target_radius for r in ok if r.target_radius is not None]
+    assert all(300 < radius < 1000 for radius in radii)  # ~700 ADC measured
+    improved = [
+        r for r in ok if r.post_sigma is not None and r.pre_sigma and r.post_sigma < r.pre_sigma
+    ]
+    assert len(improved) >= 0.8 * len(ok)
+    for r in ok:
+        assert r.n_used is not None and r.n_rejected is not None
+        assert r.n_used + r.n_rejected == r.n_events
+        assert r.timing_jitter_ns is not None and 0 < r.timing_jitter_ns < 10
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not IS_REFERENCE, reason="the status census is known for the reference file")
+def test_status_census_of_the_whole_file(real_cache: UVCache) -> None:
+    """Full analysis of the reference file (read-only: nothing is stored in the cache).
+
+    Only the status counts are checked (the flag counts depend on the tunable
+    thresholds): 442 active channels have fewer than 100 events (plan section
+    11) and every other channel fits. Measured 2026-09-24.
+    """
+    from uvcorr.analysis import analyze_all
+    from uvcorr.options import FitOptions
+
+    stored_before = real_cache.load_results()
+    results = analyze_all(real_cache, FitOptions(min_events=100))
+    statuses = {s: sum(1 for r in results if r.status == s) for s in ("ok", "too_few_events")}
+    assert len(results) == 6557
+    assert statuses == {"ok": 6115, "too_few_events": 442}
+    assert sum(r.n_events for r in results) == real_cache.metadata()["n_events_kept"]
+    assert real_cache.load_results() == stored_before

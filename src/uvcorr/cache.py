@@ -13,6 +13,11 @@ Layout (plan section 6.1)::
                                 created_at and build provenance (see ``_build``)
     /events/node_{N}/board_{B}/ rena (int8), channel (int8), u, v, pha (int16),
                                 in file order; attr n_events
+    /results/current/           the last batch analysis run: attrs options_json,
+                                created_at, uvcorr_version, results_version;
+                                table (one row per channel, every CSV column)
+    /results/current/overrides/ table: per-channel GUI re-fits, same columns
+                                plus options_json per row
 
 The build streams the file once with
 :meth:`~adc2kev.parser.packet_parser.PacketParser.iter_event_arrays`, drops
@@ -27,8 +32,22 @@ builds do not interfere. The build refuses to replace anything that is not a
 UV cache (the raw file itself, a directory, a foreign file) and a cache that
 another process has open.
 
-The ``/results`` group (analysis results and GUI overrides) is added by the
-analysis phase; the build creates only ``/metadata`` and ``/events``.
+The build creates only ``/metadata`` and ``/events``; ``/results`` is written
+by :meth:`UVCache.save_results` and the override methods (see "Results"
+below). Rebuilding a cache discards its ``/results`` (a warning is logged).
+
+Results: ``save_results`` writes a complete new group ``/results/_new`` and
+only then swaps it in (``current`` -> ``_old``, ``_new`` -> ``current``,
+delete ``_old``), so an exception part-way through leaves the previous
+``current`` intact. The overrides table is replaced the same way
+(``table_new`` -> ``table``). Readers ignore leftover ``_new`` groups and fall
+back to ``_old`` if a swap was interrupted; the next write cleans both up.
+This protects against errors and ordinary interruptions, not against power
+loss or a process killed inside an HDF5 call: HDF5 files are not journaled, so
+such a crash can corrupt the file (the cache can always be rebuilt from the
+``.dat``, but its results would be lost). HDF5 does not reclaim the space of
+replaced tables; a table is ~2-3 MB for the full system, so this only
+matters after very many saves (``h5repack`` compacts the file).
 
 No HDF5 handle is kept open between calls: every accessor opens the file,
 reads and closes it, so :class:`UVCache` objects are cheap, picklable and safe
@@ -49,20 +68,30 @@ import secrets
 import shutil
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import h5py
 import numpy as np
 import numpy.typing as npt
-from adc2kev.parser import EventBatch, PacketParser
 
 from uvcorr import __version__
-from uvcorr.channels import active_channel_mask
+from uvcorr.options import FLAG_SEPARATOR, FLAGS, STATUSES, FitOptions
+
+if TYPE_CHECKING:
+    from adc2kev.parser import EventBatch
+
+    # uvcorr.analysis imports this module; the results code imports it lazily.
+    from uvcorr.analysis import ChannelKey, ChannelResult
+
+# The build-only imports (adc2kev's parser, and uvcorr.channels, which imports
+# adc2kev.tools) happen inside the build functions: importing adc2kev pulls in
+# pandas, numba, lmfit and matplotlib (~0.5 s and ~150 MB per process), which
+# the analysis worker processes, which only read the cache, do not need.
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +100,7 @@ __all__ = [
     "CACHE_SUFFIX",
     "EVENT_DTYPES",
     "EVENT_FIELDS",
+    "RESULTS_VERSION",
     "USER_WARNING",
     "UV_CACHE_VERSION",
     "BoardUV",
@@ -81,13 +111,17 @@ __all__ = [
     "CacheBusyError",
     "InsufficientDiskSpaceError",
     "ProgressCallback",
+    "ResultsError",
     "StopFlag",
+    "StoredOverride",
+    "StoredResults",
     "UVCache",
     "UVCacheError",
     "check_disk_space",
     "compute_source_hash",
     "default_cache_path",
     "estimate_cache_bytes",
+    "merge_results",
     "open_or_build",
 ]
 
@@ -172,6 +206,10 @@ class CacheBuildCancelled(UVCacheError):
 
 class CacheBusyError(UVCacheError):
     """Another process holds the cache file's HDF5 lock (it has it open for writing)."""
+
+
+class ResultsError(UVCacheError):
+    """Stored results are missing where required, or unreadable."""
 
 
 @dataclass(frozen=True)
@@ -296,6 +334,70 @@ class BoardUV:
     def channels(self) -> list[tuple[int, int, int]]:
         """``(rena, channel, n_events)`` of every channel with events, sorted."""
         return _channel_counts(self.rena, self.channel)
+
+
+RESULTS_VERSION = "1.0.0"
+"""Layout version of ``/results`` (stored as the ``results_version`` attr)."""
+
+
+@dataclass(frozen=True)
+class StoredOverride:
+    """One per-channel re-fit stored under ``/results/current/overrides``.
+
+    Attributes:
+        result: The channel's result (``options_source="override"``).
+        options: The options it was fitted with.
+    """
+
+    result: ChannelResult
+    options: FitOptions
+
+
+@dataclass(frozen=True)
+class StoredResults:
+    """The analysis results stored in a cache (``/results/current``).
+
+    Attributes:
+        results: The batch run's rows, sorted by channel key.
+        options: The batch run's options.
+        created_at: ISO time the batch results were saved.
+        uvcorr_version: uvcorr version that saved them.
+        overrides: Per-channel re-fits by channel key (sorted).
+    """
+
+    results: tuple[ChannelResult, ...]
+    options: FitOptions
+    created_at: str
+    uvcorr_version: str
+    overrides: Mapping[ChannelKey, StoredOverride] = field(default_factory=dict)
+
+    def merged(self) -> list[ChannelResult]:
+        """The batch rows with the overrides applied (see :func:`merge_results`)."""
+        return merge_results(self.results, (o.result for o in self.overrides.values()))
+
+
+def merge_results(
+    batch: Iterable[ChannelResult], overrides: Iterable[ChannelResult]
+) -> list[ChannelResult]:
+    """Apply per-channel overrides to batch results.
+
+    An override replaces the batch row of its channel and is marked
+    ``options_source="override"``; an override for a channel without a batch
+    row is added. This is what the exports (CLI and GUI) write.
+
+    Args:
+        batch: The batch results.
+        overrides: The override results.
+
+    Returns:
+        The merged results, sorted by channel key.
+    """
+    merged = {result.key: result for result in batch}
+    for result in overrides:
+        if result.options_source != "override":
+            result = replace(result, options_source="override")
+        merged[result.key] = result
+    return [merged[key] for key in sorted(merged)]
 
 
 def default_cache_path(dat_path: str | Path) -> Path:
@@ -643,6 +745,208 @@ class UVCache:
             raise KeyError(f"No cached events for node {node} board {board}")
         return group
 
+    # ------------------------------------------------------------------
+    # Results (plan 6.1)
+    # ------------------------------------------------------------------
+
+    def save_results(
+        self,
+        results: Iterable[ChannelResult],
+        options: FitOptions,
+        *,
+        keep_overrides: bool = True,
+    ) -> None:
+        """Store a batch run's results as ``/results/current``, replacing any previous ones.
+
+        The new group is written completely before it replaces the old one
+        (module docstring), so an exception leaves the previous results
+        intact.
+
+        Overrides are kept by default: they are deliberate per-channel user
+        choices, computed on the same events, and stay valid across batch
+        runs. Pass ``keep_overrides=False`` to drop them.
+
+        Args:
+            results: One result per channel, each with
+                ``options_source="batch"``.
+            options: The options of the batch run.
+            keep_overrides: Carry the existing overrides over to the new
+                results.
+
+        Raises:
+            ValueError: If a result is not a batch result or two results
+                have the same channel key.
+            CacheBusyError: If another process holds the cache's lock.
+            OSError: If the file cannot be opened for writing.
+        """
+        rows = sorted(results, key=lambda result: result.key)
+        _check_unique_keys(rows)
+        for result in rows:
+            if result.options_source != "batch":
+                raise ValueError(
+                    f"save_results takes batch results; {result.key} has options_source "
+                    f"{result.options_source!r} (store re-fits with save_override)"
+                )
+        table = _encode_results(rows, None)
+        with _open_h5(self._path, "r+") as h5f:
+            group = h5f.require_group(_RESULTS_GROUP)
+            _recover_results(group)
+            new = group.create_group(_RESULTS_NEW)
+            try:
+                attrs = new.attrs
+                attrs["options_json"] = options.to_json()
+                attrs["created_at"] = datetime.now().isoformat()
+                attrs["uvcorr_version"] = __version__
+                attrs["results_version"] = RESULTS_VERSION
+                attrs["n_channels"] = np.int64(len(rows))
+                new.create_dataset(_TABLE, data=table)
+                current = group.get(_RESULTS_CURRENT)
+                if keep_overrides and current is not None and _OVERRIDES in current:
+                    _copy_overrides(current[_OVERRIDES], new)
+                if current is not None:
+                    group.move(_RESULTS_CURRENT, _RESULTS_OLD)
+                group.move(_RESULTS_NEW, _RESULTS_CURRENT)  # commit point
+            except BaseException:
+                _undo_results_write(group)
+                raise
+            # The new results are in place; a leftover _old is harmless (readers
+            # ignore it, the next write removes it), so cleanup is best-effort.
+            _delete_quietly(group, _RESULTS_OLD)
+        logger.info(f"Saved {len(rows)} channel results to {self._path}")
+
+    def load_results(self) -> StoredResults | None:
+        """Load the stored results and overrides.
+
+        Results written by a newer uvcorr still load: options are parsed
+        leniently (``FitOptions.from_json(strict=False)``), unknown table
+        columns are ignored, unknown flags are dropped and rows with an
+        unknown status, polarity or options source are skipped, each with a
+        logged warning. (Rewriting the overrides with this version, through
+        ``save_override``/``delete_override``, then drops such rows for good.)
+
+        Returns:
+            The stored results, or None if the cache has none (or the file
+            does not exist).
+
+        Raises:
+            ResultsError: If the stored results cannot be decoded.
+            CacheBusyError: If another process holds the cache's lock.
+        """
+        if not self._path.is_file():
+            return None
+        with _open_h5(self._path) as h5f:
+            current = _current_results(h5f)
+            if current is None:
+                return None
+            try:
+                attrs = current.attrs
+                options = FitOptions.from_json(_attr_text(attrs["options_json"]), strict=False)
+                rows = _decode_results(current[_TABLE][()], with_options=False)
+                overrides = {
+                    key: StoredOverride(result, opts)
+                    for key, (result, opts) in _read_override_entries(current).items()
+                }
+                return StoredResults(
+                    results=tuple(result for result, _ in rows),
+                    options=options,
+                    created_at=_attr_text(attrs.get("created_at", "")),
+                    uvcorr_version=_attr_text(attrs.get("uvcorr_version", "")),
+                    overrides=dict(sorted(overrides.items())),
+                )
+            except (KeyError, ValueError, TypeError) as exc:
+                raise ResultsError(
+                    f"The stored results in {self._path} are unreadable: {exc}"
+                ) from exc
+
+    def merged_results(self) -> list[ChannelResult]:
+        """The stored batch results with the overrides applied (empty if none are stored).
+
+        Raises:
+            ResultsError: If the stored results cannot be decoded.
+            CacheBusyError: If another process holds the cache's lock.
+        """
+        stored = self.load_results()
+        return stored.merged() if stored is not None else []
+
+    def save_override(self, result: ChannelResult, options: FitOptions) -> None:
+        """Store (insert or replace) one channel's re-fit as an override.
+
+        The result is stored with ``options_source="override"``.
+
+        Args:
+            result: The channel's re-fitted result.
+            options: The options it was fitted with.
+
+        Raises:
+            ResultsError: If the cache has no batch results to attach the
+                override to (run a batch first).
+            CacheBusyError: If another process holds the cache's lock.
+        """
+        if result.options_source != "override":
+            result = replace(result, options_source="override")
+        with _open_h5(self._path, "r+") as h5f:
+            current = self._current_for_overrides(h5f)
+            entries = _read_override_entries(current)
+            entries[result.key] = (result, options)
+            _write_override_entries(current, entries)
+        logger.info(f"Saved the override of {result.key} to {self._path}")
+
+    def delete_override(self, key: ChannelKey | tuple[int, int, int, int]) -> bool:
+        """Delete one channel's override.
+
+        Args:
+            key: ``(node, board, rena, channel)``.
+
+        Returns:
+            True if an override was deleted, False if there was none.
+
+        Raises:
+            CacheBusyError: If another process holds the cache's lock.
+        """
+        if not self._path.is_file():
+            return False
+        wanted = tuple(int(k) for k in key)
+        with _open_h5(self._path, "r+") as h5f:
+            current = _writable_current(h5f)
+            if current is None:
+                return False
+            entries = _read_override_entries(current)
+            matches = [k for k in entries if tuple(k) == wanted]
+            if not matches:
+                return False
+            del entries[matches[0]]
+            _write_override_entries(current, entries)
+        return True
+
+    def clear_overrides(self) -> int:
+        """Delete every override.
+
+        Returns:
+            The number of overrides deleted.
+
+        Raises:
+            CacheBusyError: If another process holds the cache's lock.
+        """
+        if not self._path.is_file():
+            return 0
+        with _open_h5(self._path, "r+") as h5f:
+            current = _writable_current(h5f)
+            if current is None:
+                return 0
+            n = len(_read_override_entries(current))
+            if _OVERRIDES in current:
+                del current[_OVERRIDES]
+        return n
+
+    def _current_for_overrides(self, h5f: Any) -> Any:
+        current = _writable_current(h5f)
+        if current is None:
+            raise ResultsError(
+                f"{self._path} stores no batch results to attach an override to; "
+                "run a batch analysis first"
+            )
+        return current
+
 
 def open_or_build(
     dat_path: str | Path,
@@ -816,6 +1120,8 @@ def _split_batch(batch: EventBatch, counts: _Counts) -> list[tuple[int, _Columns
     Raises:
         CacheBuildError: If a column does not have the expected dtype.
     """
+    from uvcorr.channels import active_channel_mask  # build-only import, see top
+
     for name, dtype in _BATCH_DTYPES.items():
         actual = getattr(batch, name).dtype
         if actual != dtype:
@@ -877,6 +1183,8 @@ def _build(
     source_stat = dat_path.stat()
     source_hash = compute_source_hash(dat_path)
     file_size = source_stat.st_size
+
+    from adc2kev.parser import PacketParser  # build-only import, see top
 
     parser = PacketParser(dat_path)
     counts = _Counts()
@@ -969,6 +1277,276 @@ def _build(
         max_buffered_events=writer.max_buffered,
         cache_bytes=0,
     )
+
+
+# ----------------------------------------------------------------------
+# Results internals
+# ----------------------------------------------------------------------
+
+_RESULTS_GROUP = "results"
+_RESULTS_CURRENT = "current"
+_RESULTS_NEW = "_new"  # a batch write in progress (or left by a crash)
+_RESULTS_OLD = "_old"  # the previous results during the swap
+_OVERRIDES = "overrides"
+_TABLE = "table"
+_TABLE_NEW = "table_new"  # an overrides write in progress
+_OPTIONS_COLUMN = "options_json"
+_MISSING_COUNT = -1  # a count column's None in the HDF5 table
+
+_OverrideEntries = dict["ChannelKey", tuple["ChannelResult", FitOptions]]
+
+
+def _check_unique_keys(rows: list[ChannelResult]) -> None:
+    for prev, row in zip(rows, rows[1:]):
+        if prev.key == row.key:
+            raise ValueError(f"Duplicate results for {row.key}")
+
+
+def _results_dtype(with_options: bool) -> np.dtype[Any]:
+    """Compound dtype of a results table: one field per CSV column (+ options_json)."""
+    from uvcorr import analysis
+
+    text = h5py.string_dtype()  # variable-length UTF-8
+    fields: list[tuple[str, Any]] = []
+    for column in analysis.RESULT_COLUMNS:
+        if column.kind in (analysis.KIND_INT, analysis.KIND_COUNT):
+            fields.append((column.name, np.int64))
+        elif column.kind in (analysis.KIND_FLOAT, analysis.KIND_FLOAT_PRECISE):
+            fields.append((column.name, np.float64))
+        else:
+            fields.append((column.name, text))
+    if with_options:
+        fields.append((_OPTIONS_COLUMN, text))
+    return np.dtype(fields)
+
+
+def _object_array(values: list[Any]) -> npt.NDArray[np.object_]:
+    array = np.empty(len(values), dtype=object)
+    array[:] = values
+    return array
+
+
+def _encode_results(
+    rows: list[ChannelResult], options: list[FitOptions] | None
+) -> npt.NDArray[np.void]:
+    """Encode results as a structured array (None: NaN for floats, -1 for counts)."""
+    from uvcorr import analysis
+
+    table = np.zeros(len(rows), dtype=_results_dtype(options is not None))
+    for column in analysis.RESULT_COLUMNS:
+        values = [getattr(row, column.name) for row in rows]
+        kind = column.kind
+        if kind == analysis.KIND_COUNT:
+            table[column.name] = [_MISSING_COUNT if value is None else value for value in values]
+        elif kind in (analysis.KIND_FLOAT, analysis.KIND_FLOAT_PRECISE):
+            table[column.name] = [math.nan if value is None else value for value in values]
+        elif kind == analysis.KIND_FLAGS:
+            table[column.name] = _object_array([row.flags_text for row in rows])
+        elif kind == analysis.KIND_STR:
+            table[column.name] = _object_array(values)
+        else:
+            table[column.name] = values
+    if options is not None:
+        table[_OPTIONS_COLUMN] = _object_array([opts.to_json() for opts in options])
+    return table
+
+
+def _decode_results(
+    table: npt.NDArray[np.void], *, with_options: bool
+) -> list[tuple[ChannelResult, FitOptions | None]]:
+    """Decode a results table; unknown columns are ignored, missing optional ones are None.
+
+    Unknown flags are dropped and rows with an unknown status, polarity or
+    options source are skipped, each with a warning, so results written by a
+    newer uvcorr still load.
+
+    Raises:
+        ValueError, TypeError, KeyError: If the table cannot be decoded.
+    """
+    from uvcorr import analysis
+
+    names = set(table.dtype.names or ())
+    columns: dict[str, list[Any]] = {}
+    for column in analysis.RESULT_COLUMNS:
+        if column.name not in names:
+            continue
+        data = table[column.name]
+        kind = column.kind
+        if kind == analysis.KIND_COUNT:
+            columns[column.name] = [None if v < 0 else v for v in data.astype(np.int64).tolist()]
+        elif kind == analysis.KIND_INT:
+            columns[column.name] = data.astype(np.int64).tolist()
+        elif kind in (analysis.KIND_FLOAT, analysis.KIND_FLOAT_PRECISE):
+            columns[column.name] = data.astype(np.float64).tolist()  # NaN -> None on construction
+        else:
+            columns[column.name] = [_attr_text(value) for value in data]
+    unknown = names - set(analysis.CSV_COLUMNS) - {_OPTIONS_COLUMN}
+    if unknown:
+        logger.debug(f"Ignoring unknown results column(s) {sorted(unknown)}")
+    options: list[FitOptions | None] = [None] * len(table)
+    if with_options:
+        options = [
+            FitOptions.from_json(_attr_text(value), strict=False)
+            for value in table[_OPTIONS_COLUMN]
+        ]
+    # Values a newer uvcorr may write: unknown flags are dropped, rows with an
+    # unknown status, polarity or options source are skipped (with a warning).
+    known_flags = set(FLAGS)
+    allowed = {
+        "status": set(STATUSES),
+        "polarity": set(analysis.POLARITIES),
+        "options_source": set(analysis.OPTIONS_SOURCES),
+    }
+    dropped_flags: set[str] = set()
+    skipped: dict[str, set[str]] = {}
+    decoded: list[tuple[ChannelResult, FitOptions | None]] = []
+    for i in range(len(table)):
+        row = {name: values[i] for name, values in columns.items()}
+        bad = {k: row[k] for k, ok in allowed.items() if k in row and row[k] not in ok}
+        if bad:
+            for name, value in bad.items():
+                skipped.setdefault(name, set()).add(str(value))
+            continue
+        if "flags" in row:
+            flags = [f for f in str(row["flags"]).split(FLAG_SEPARATOR) if f]
+            dropped_flags.update(f for f in flags if f not in known_flags)
+            row["flags"] = tuple(f for f in flags if f in known_flags)
+        decoded.append((analysis.ChannelResult.from_dict(row), options[i]))
+    if dropped_flags:
+        logger.warning(f"Ignoring unknown flag(s) in the stored results: {sorted(dropped_flags)}")
+    if skipped:
+        n_skipped = len(table) - len(decoded)
+        detail = ", ".join(f"{name} {sorted(values)}" for name, values in skipped.items())
+        logger.warning(f"Skipping {n_skipped} stored result row(s) with unknown {detail}")
+    return decoded
+
+
+def _attr_text(value: Any) -> str:
+    """An HDF5 string (bytes, numpy or Python str) as a Python str."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _current_results(h5f: Any) -> Any:
+    """The complete stored results group: ``current``, else an interrupted swap's ``_old``."""
+    group = h5f.get(_RESULTS_GROUP)
+    if group is None:
+        return None
+    for name in (_RESULTS_CURRENT, _RESULTS_OLD):
+        candidate = group.get(name)
+        if candidate is not None and _TABLE in candidate:
+            return candidate
+    return None
+
+
+def _recover_results(group: Any) -> None:
+    """Clean up after an interrupted results write (before writing again).
+
+    An orphaned ``_old`` (no ``current``) becomes ``current`` again; leftover
+    ``_new``/``_old`` groups are deleted on a best-effort basis (readers ignore
+    them).
+    """
+    _delete_quietly(group, _RESULTS_NEW)
+    if _RESULTS_OLD in group:
+        if _RESULTS_CURRENT in group:
+            _delete_quietly(group, _RESULTS_OLD)
+        else:
+            group.move(_RESULTS_OLD, _RESULTS_CURRENT)
+
+
+def _writable_current(h5f: Any) -> Any:
+    """``/results/current`` of a file open for writing, after recovering an interrupted write."""
+    group = h5f.get(_RESULTS_GROUP)
+    if group is None:
+        return None
+    _recover_results(group)
+    return _current_results(h5f)
+
+
+def _delete_quietly(group: Any, name: str) -> None:
+    """Delete ``group[name]`` if present; log instead of raising (post-commit cleanup)."""
+    try:
+        if name in group:
+            del group[name]
+    except Exception as exc:
+        logger.warning(f"Could not remove {group.name}/{name} (it is cleaned up later): {exc}")
+
+
+def _undo_results_write(group: Any) -> None:
+    """Restore the previous results after a failed :meth:`UVCache.save_results`."""
+    try:
+        if _RESULTS_NEW in group:
+            del group[_RESULTS_NEW]
+        if _RESULTS_CURRENT not in group and _RESULTS_OLD in group:
+            group.move(_RESULTS_OLD, _RESULTS_CURRENT)
+    except Exception as exc:  # keep the original error; readers fall back to _old
+        logger.warning(f"Could not clean up after a failed results write: {exc}")
+
+
+def _override_table(current: Any) -> Any:
+    """The overrides table of a results group (an interrupted swap's ``table_new``), or None."""
+    overrides = current.get(_OVERRIDES)
+    if overrides is None:
+        return None
+    for name in (_TABLE, _TABLE_NEW):
+        table = overrides.get(name)
+        if table is not None:
+            return table
+    return None
+
+
+def _copy_overrides(source: Any, new: Any) -> None:
+    """Copy the overrides table of ``source`` (an overrides group) into group ``new``."""
+    table = source.get(_TABLE)
+    if table is None:
+        table = source.get(_TABLE_NEW)
+    if table is None:
+        return
+    new.create_group(_OVERRIDES).create_dataset(_TABLE, data=table[()])
+
+
+def _read_override_entries(current: Any) -> _OverrideEntries:
+    table = _override_table(current)
+    if table is None:
+        return {}
+    entries: _OverrideEntries = {}
+    for result, options in _decode_results(table[()], with_options=True):
+        assert options is not None
+        entries[result.key] = (result, options)
+    return entries
+
+
+def _write_override_entries(current: Any, entries: _OverrideEntries) -> None:
+    """Replace the overrides table (``table_new`` is written first, then swapped in)."""
+    if not entries:
+        if _OVERRIDES in current:
+            del current[_OVERRIDES]
+        return
+    keys = sorted(entries)
+    table = _encode_results([entries[key][0] for key in keys], [entries[key][1] for key in keys])
+    overrides = current.require_group(_OVERRIDES)
+    if _TABLE_NEW in overrides:
+        if _TABLE in overrides:
+            del overrides[_TABLE_NEW]  # left by a failed write; `table` is current
+        else:
+            overrides.move(_TABLE_NEW, _TABLE)  # committed but never renamed
+    try:
+        overrides.create_dataset(_TABLE_NEW, data=table)
+    except BaseException:
+        if _TABLE_NEW in overrides:
+            del overrides[_TABLE_NEW]
+        raise
+    try:
+        if _TABLE in overrides:
+            del overrides[_TABLE]  # commit point: readers now use table_new
+    except BaseException:
+        _delete_quietly(overrides, _TABLE_NEW)
+        raise
+    try:
+        overrides.move(_TABLE_NEW, _TABLE)
+    except Exception as exc:  # committed already: readers fall back to table_new
+        logger.warning(f"Could not rename the new overrides table (it is used as is): {exc}")
 
 
 # ----------------------------------------------------------------------
