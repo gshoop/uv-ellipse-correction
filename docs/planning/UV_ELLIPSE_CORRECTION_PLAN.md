@@ -1,6 +1,6 @@
 # UV Ellipse Correction from Raw Data: Plan
 
-**Status:** Phases 0-1 done (2026-09-24): skeleton; channels, UV cache and `uvcorr build-cache`. Next: phase 2.
+**Status:** Phases 0-2 done (2026-09-24): skeleton; channels, UV cache and `uvcorr build-cache`; ellipse fit and metrics. Next: phase 3.
 **Repository:** `/home/swuupii/uv-ellipse-correction` (git, branch `main`)
 **Package name:** `uvcorr` (confirmed). Console scripts: `uvcorr` (CLI), `uvcorr-gui`.
 
