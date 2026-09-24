@@ -556,6 +556,23 @@ class TestRadialStats:
         r = np.random.default_rng(10).normal(600.0, 5.0, 3000)
         assert radial_stats(np.r_[math.nan, r, math.inf]) == radial_stats(r)
 
+    @pytest.mark.parametrize("min_bin_width", [metrics.ADC_MIN_BIN_WIDTH, None])
+    def test_stats_and_detail_in_one_fit(self, min_bin_width: float | None) -> None:
+        # One call gives exactly radial_stats and radial_fit_detail (used by the GUI tab)
+        rng = np.random.default_rng(13)
+        r = np.r_[rng.normal(600.0, 5.0, 20_000), rng.uniform(300.0, 590.0, 2_000), math.nan]
+        stats, detail = metrics.radial_stats_and_detail(r, min_bin_width)
+        assert stats == radial_stats(r, min_bin_width)
+        expected = metrics.radial_fit_detail(r, min_bin_width)
+        assert detail.stats == expected.stats == stats.gauss
+        np.testing.assert_array_equal(detail.edges, expected.edges)
+        np.testing.assert_array_equal(detail.counts, expected.counts)
+        assert detail.amplitude == expected.amplitude
+        assert detail.fit_range == expected.fit_range
+        few_stats, few_detail = metrics.radial_stats_and_detail([600.0, 601.0])
+        assert few_stats == radial_stats([600.0, 601.0]) and not few_stats.ok
+        assert few_detail.edges.size == 0
+
     @pytest.mark.parametrize(
         "values",
         [[], [600.0], [600.0, 601.0], [600.0] * 60, [math.nan] * 5],

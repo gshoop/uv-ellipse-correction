@@ -6,15 +6,19 @@ import pytest
 from pytestqt.qtbot import QtBot
 
 from tests.conftest import RingFiles
+from tests.gui.ring_cache import OUTLIERS
 from uvcorr.analysis import AnalysisError, WorkerCrashedError
-from uvcorr.cache import UVCacheError
+from uvcorr.cache import UVCache, UVCacheError
 from uvcorr.gui.session import OpenedFile, UVSession, load_cache
 from uvcorr.gui.threads import (
     WORKER_CRASH_MESSAGE,
+    BoardGridThread,
     CacheBuildThread,
     CacheOpenThread,
     ChannelDetailThread,
     FitAllThread,
+    RefitThread,
+    RevertThread,
     error_text,
 )
 from uvcorr.options import FitOptions
@@ -104,3 +108,82 @@ def test_error_text() -> None:
     # One GUI-worded message, not the analysis's CLI advice
     assert error_text(WorkerCrashedError()) == WORKER_CRASH_MESSAGE
     assert "--workers 1 (workers=1)" not in WORKER_CRASH_MESSAGE
+
+
+def test_refit_thread(qtbot: QtBot, results_files: RingFiles) -> None:
+    session = UVSession()
+    session.install(load_cache(results_files.cache))
+    request = session.refit_request(FitOptions(robust=False), board=(1, 15))
+    thread = RefitThread(session, request)
+    progress: list[tuple[int, int]] = []
+    thread.progress.connect(lambda done, total: progress.append((done, total)))
+    with qtbot.waitSignal(thread.finished, timeout=20_000) as blocker:
+        thread.start()
+    thread.wait()
+    changed = session.apply_refit(blocker.args[0])
+    assert OUTLIERS in changed and len(changed) == 6 and progress[-1] == (6, 6)
+
+    stopped = RefitThread(session, session.refit_request(FitOptions(), board=(1, 15)))
+    stopped.stop()
+    with qtbot.waitSignal(stopped.stopped, timeout=20_000):
+        stopped.start()
+    stopped.wait()
+    assert len(session.override_keys(1, 15)) == 6 and not session.batch_running
+
+
+def test_revert_thread(qtbot: QtBot, results_files: RingFiles) -> None:
+    session = UVSession()
+    session.install(load_cache(results_files.cache))
+    session.apply_refit(
+        session.run_refit(session.refit_request(FitOptions(robust=False), board=(1, 15)))
+    )
+    request = session.revert_request(board=(1, 15))
+    assert request is not None
+    thread = RevertThread(session, request)
+    with qtbot.waitSignal(thread.finished, timeout=20_000) as blocker:
+        thread.start()
+    thread.wait()
+    assert len(session.apply_revert(blocker.args[0])) == 6 and session.override_keys() == []
+
+
+def test_channel_detail_thread_always_ends_with_views_or_failed(
+    qtbot: QtBot, ring_files: RingFiles, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error in the second stage ends the load with ``failed`` (the window's queue goes on)."""
+    session = UVSession()
+    session.install(load_cache(ring_files.cache))
+    key = session.data_channels[0]
+
+    def broken(_self: ChannelDetailThread, _detail: object) -> None:
+        raise RuntimeError("views broke")
+
+    monkeypatch.setattr(ChannelDetailThread, "_compute_views", broken)
+    thread = ChannelDetailThread(session, session.detail_request(key), generation=3)
+    signals: list[str] = []
+    thread.done.connect(lambda *_: signals.append("done"))
+    thread.views.connect(lambda *_: signals.append("views"))
+    with qtbot.waitSignal(thread.failed, timeout=20_000) as blocker:
+        thread.start()
+    thread.wait()
+    qtbot.waitUntil(lambda: "done" in signals, timeout=5_000)
+    assert blocker.args == [3, "RuntimeError: views broke"] and "views" not in signals
+    # Skipped views: views(None) is the last signal
+    thread = ChannelDetailThread(session, session.detail_request(key), generation=4)
+    thread.skip_views()
+    with qtbot.waitSignal(thread.views, timeout=20_000) as blocker:
+        thread.start()
+    thread.wait()
+    assert blocker.args == [4, None]
+
+
+def test_board_grid_thread_reads_the_cache_it_was_given(
+    qtbot: QtBot, ring_files: RingFiles
+) -> None:
+    """The cache is a snapshot from the GUI thread, not the session's current file."""
+    session = UVSession()  # no file open: the thread must not ask the session for one
+    thread = BoardGridThread(session, UVCache(ring_files.cache), 1, 15, {}, generation=2)
+    with qtbot.waitSignal(thread.done, timeout=20_000) as blocker:
+        thread.start()
+    thread.wait()
+    generation, data = blocker.args
+    assert generation == 2 and (data.node, data.board) == (1, 15) and data.n_events > 0

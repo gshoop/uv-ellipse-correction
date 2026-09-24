@@ -16,26 +16,53 @@ reports back through signals, which Qt queues to the GUI thread:
 poll (``stop_flag``), so stopping takes effect within one parser batch or
 about 0.1 s of the analysis.
 
-:class:`ChannelDetailThread` is the scatter's short-lived loader (specview's
-``ScatterWorker`` pattern): it carries a generation number so the main window
-can drop results that a newer selection has superseded.
+:class:`RefitThread` re-fits one channel or board in-process (stoppable
+between channels) and stores the outcome, as :class:`FitAllThread` stores a
+batch; :class:`RevertThread` deletes overrides (a write that can wait up to
+a second for a busy file, so it does not run on the GUI thread either).
+
+:class:`ChannelDetailThread` is the channel tabs' short-lived loader
+(specview's ``ScatterWorker`` pattern): it carries a generation number so the
+main window can drop results that a newer selection has superseded. It works
+in two stages, so the scatter is drawn as soon as its data are ready: first
+the channel detail (the Scatter tab), then the Radial and Radius vs angle
+tabs' data computed from it (:class:`DetailViews`, up to ~0.3 s more for the
+largest channel). :class:`BoardGridThread` computes the Board grid tab's
+data for one board, with its own generation number.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from uvcorr.analysis import AnalysisCancelled, AnalysisError, WorkerCrashedError
-from uvcorr.cache import BuildSettings, CacheBuildCancelled, UVCacheError
+from uvcorr.analysis import (
+    AnalysisCancelled,
+    AnalysisError,
+    ChannelKey,
+    ChannelResult,
+    WorkerCrashedError,
+)
+from uvcorr.cache import BuildSettings, CacheBuildCancelled, UVCache, UVCacheError
+from uvcorr.gui.angle import AngleViewData, compute_angle_view
+from uvcorr.gui.board_grid import compute_board_grid
+from uvcorr.gui.radial import RadialViewData, compute_radial_view
 from uvcorr.gui.session import (
     BatchOutcome,
+    ChannelDetail,
     DetailRequest,
     OpenedFile,
+    RefitOutcome,
+    RefitRequest,
+    RevertOutcome,
+    RevertRequest,
     SessionError,
     UVSession,
     load_cache,
@@ -47,10 +74,14 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "WORKER_CRASH_MESSAGE",
+    "BoardGridThread",
     "CacheBuildThread",
     "CacheOpenThread",
     "ChannelDetailThread",
+    "DetailViews",
     "FitAllThread",
+    "RefitThread",
+    "RevertThread",
     "error_text",
 ]
 
@@ -214,31 +245,120 @@ class FitAllThread(_WorkerThread):
         options: FitOptions,
         *,
         workers: int | None = None,
+        keep_overrides: bool = True,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.session = session
         self.options = options
         self.workers = workers
+        self.keep_overrides = keep_overrides
 
     def _work(self) -> BatchOutcome:
         return self.session.run_batch(
             self.options,
+            keep_overrides=self.keep_overrides,
             workers=self.workers,
             progress_cb=self.progress.emit,
             stop_flag=self._stop_event,
         )
 
 
+class RefitThread(_WorkerThread):
+    """Re-fit a channel or board and store the outcome (:meth:`UVSession.run_refit`).
+
+    Runs in-process (no process pool): a board is at most ~3 s of fitting.
+    :meth:`stop` takes effect before the next channel, so it stops a board
+    re-fit, not a single channel's fit.
+
+    Signals:
+        progress(int, int): ``(channels_done, channels_total)``.
+        finished(RefitOutcome): The stored outcome, for
+            :meth:`UVSession.apply_refit`.
+        error(str): The re-fit failed or could not be stored (nothing changed).
+        stopped(): The re-fit was stopped; nothing was stored.
+    """
+
+    progress = pyqtSignal(int, int)
+    _LABEL = "Re-fit"
+
+    def __init__(
+        self, session: UVSession, request: RefitRequest, parent: QObject | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.session = session
+        self.request = request
+
+    def _work(self) -> RefitOutcome:
+        return self.session.run_refit(
+            self.request, progress_cb=self.progress.emit, stop_flag=self._stop_event
+        )
+
+
+class RevertThread(_WorkerThread):
+    """Delete overrides in one cache write (:meth:`UVSession.run_revert`).
+
+    Not stoppable (``stop`` is accepted and ignored): the write is short.
+
+    Signals:
+        finished(RevertOutcome): The outcome, for :meth:`UVSession.apply_revert`.
+        error(str): The write failed (nothing was deleted).
+    """
+
+    _LABEL = "Revert to batch"
+
+    def __init__(
+        self, session: UVSession, request: RevertRequest, parent: QObject | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.session = session
+        self.request = request
+
+    def _work(self) -> RevertOutcome:
+        return self.session.run_revert(self.request)
+
+
+@dataclass(frozen=True, eq=False)
+class DetailViews:
+    """The Radial and Radius vs angle tabs' data of one channel (second stage).
+
+    Attributes:
+        radial: :func:`~uvcorr.gui.radial.compute_radial_view` of the detail,
+            or None if it failed.
+        angle: :func:`~uvcorr.gui.angle.compute_angle_view` of the detail,
+            or None if it failed.
+        error: Why a view could not be computed ("" if both were).
+        seconds: Time spent computing both.
+    """
+
+    radial: RadialViewData | None
+    angle: AngleViewData | None
+    error: str
+    seconds: float
+
+
 class ChannelDetailThread(QThread):
-    """Load one channel and recompute its fit mask for the scatter (:meth:`UVSession.compute_detail`).
+    """Load one channel for the channel tabs, in two stages.
+
+    1. :meth:`UVSession.compute_detail` (points, kept mask, correction):
+       ``done``.
+    2. The Radial and Radius vs angle tabs' data (:class:`DetailViews`):
+       ``views``; its value is None when :meth:`skip_views` was called (a
+       newer selection superseded this one), so no time is spent on a
+       channel nobody will see.
+
+    The last signal is always exactly one of ``views`` and ``failed`` (also
+    after ``done``, if the second stage raises), so the main window's queue
+    of loads never stalls.
 
     Signals:
         done(int, ChannelDetail): ``(generation, detail)``.
+        views(int, DetailViews | None): ``(generation, views)``.
         failed(int, str): ``(generation, message)``.
     """
 
     done = pyqtSignal(int, object)
+    views = pyqtSignal(int, object)
     failed = pyqtSignal(int, str)
 
     def __init__(
@@ -252,13 +372,96 @@ class ChannelDetailThread(QThread):
         self.session = session
         self.request = request
         self.generation = generation
+        self._skip_views = threading.Event()
+
+    def skip_views(self) -> None:
+        """Do not compute the second stage (emit ``views`` with None instead)."""
+        self._skip_views.set()
 
     def run(self) -> None:
-        """Compute the detail and emit ``done`` or ``failed``."""
+        """Compute the detail, then the views; see the class docstring for the signals.
+
+        Exactly one of ``failed`` and ``views`` is always the last signal,
+        even if something unexpected escapes (the main window starts the
+        next load only when it arrives).
+        """
+        ended = False
         try:
-            detail = self.session.compute_detail(self.request)
+            try:
+                detail = self.session.compute_detail(self.request)
+                self.done.emit(self.generation, detail)
+                views = None if self._skip_views.is_set() else self._compute_views(detail)
+            except Exception as exc:
+                logger.exception(f"Loading {self.request.key} failed")
+                self.failed.emit(self.generation, error_text(exc))
+                ended = True
+                return
+            self.views.emit(self.generation, views)
+            ended = True
+        finally:
+            if not ended:  # something beyond Exception: still release the window's queue
+                logger.error(f"Loading {self.request.key} stopped unexpectedly")
+                self.failed.emit(self.generation, "the channel load stopped unexpectedly")
+
+    def _compute_views(self, detail: ChannelDetail) -> DetailViews:
+        """The Radial and Radius vs angle tabs' data (a failed view is reported, not raised)."""
+        t_start = time.perf_counter()
+        radial: RadialViewData | None = None
+        angle: AngleViewData | None = None
+        errors: list[str] = []
+        try:
+            radial = compute_radial_view(detail)
         except Exception as exc:
-            logger.exception(f"Loading {self.request.key} for the scatter failed")
+            logger.exception(f"Computing the Radial tab of {self.request.key} failed")
+            errors.append(f"radial histograms: {error_text(exc)}")
+        try:
+            angle = compute_angle_view(detail)
+        except Exception as exc:
+            logger.exception(f"Computing the Radius vs angle tab of {self.request.key} failed")
+            errors.append(f"radius vs angle: {error_text(exc)}")
+        return DetailViews(radial, angle, "; ".join(errors), time.perf_counter() - t_start)
+
+
+class BoardGridThread(QThread):
+    """Compute the Board grid tab's data of one board.
+
+    Runs :func:`~uvcorr.gui.board_grid.compute_board_grid` on the board's
+    events, read from ``cache`` through the session's board cache; the cache
+    and the results are a snapshot taken on the GUI thread.
+
+    Signals:
+        done(int, BoardGridData): ``(generation, data)``.
+        failed(int, str): ``(generation, message)``.
+    """
+
+    done = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+
+    def __init__(
+        self,
+        session: UVSession,
+        cache: UVCache,
+        node: int,
+        board: int,
+        results: Mapping[ChannelKey, ChannelResult | None],
+        generation: int,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.session = session
+        self.cache = cache
+        self.node = node
+        self.board = board
+        self.results = results
+        self.generation = generation
+
+    def run(self) -> None:
+        """Compute the grid and emit ``done`` or ``failed``."""
+        try:
+            board_uv = self.session.board_data(self.node, self.board, self.cache)
+            data = compute_board_grid(board_uv, self.results)
+        except Exception as exc:
+            logger.exception(f"Computing the board grid of node {self.node} board {self.board}")
             self.failed.emit(self.generation, error_text(exc))
             return
-        self.done.emit(self.generation, detail)
+        self.done.emit(self.generation, data)

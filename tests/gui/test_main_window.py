@@ -3,35 +3,38 @@
 Every test drives the real worker threads (cache build, cache open, Fit All
 with ``workers=1``, scatter loading) on the synthetic ring files and waits for
 them with ``qtbot.waitUntil``. Dialogs are replaced by recorders
-(``window._show_error`` / ``window._ask``).
+(``window._show_error`` / ``window._ask``); see ``window_helpers.py``.
+Re-fits, overrides and exports are tested in ``test_refit.py`` and
+``test_export.py``.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import os
 import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import h5py
 import pytest
-from PyQt6.QtCore import QPoint, QRectF, Qt
+from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
 
 from tests.conftest import RingFiles
-from tests.gui.ring_cache import (
-    CLEAN,
-    OUTLIERS,
-    TOO_FEW,
-    copy_files,
-    store_batch_results,
+from tests.gui.ring_cache import CLEAN, OUTLIERS, TOO_FEW
+from tests.gui.window_helpers import (
+    WAIT_MS,
+    MakeWindow,
+    aim,
+    click_map_cell,
+    open_and_wait,
+    wait_idle,
 )
 from uvcorr.analysis import ChannelKey
 from uvcorr.cache import BuildSettings, UVCache
@@ -41,77 +44,15 @@ from uvcorr.gui._layout import app_settings
 from uvcorr.gui._system_map_model import ChannelAddress
 from uvcorr.gui.map_colors import COLOR_MODES
 from uvcorr.gui.session import channel_title
-from uvcorr.gui.system_map import VIEW_ANODES, VIEW_CATHODES
-from uvcorr.gui.window import PHASE5_TABS, MainWindow
+from uvcorr.gui.system_map import VIEW_CATHODES
+from uvcorr.gui.window import TAB_TITLES, MainWindow
 from uvcorr.options import FLAG_HIGH_REJECTION, STATUS_OK
 
 pytestmark = pytest.mark.gui
 
-WAIT_MS = 20_000
-
-
-@pytest.fixture(scope="module")
-def _results_master(
-    tmp_path_factory: pytest.TempPathFactory, _ring_files_master: RingFiles
-) -> RingFiles:
-    dat, cache = copy_files(
-        _ring_files_master.dat, _ring_files_master.cache, tmp_path_factory.mktemp("win")
-    )
-    store_batch_results(cache)
-    return RingFiles(dat, cache)
-
-
-@pytest.fixture
-def results_files(tmp_path: Path, _results_master: RingFiles) -> RingFiles:
-    dat, cache = copy_files(_results_master.dat, _results_master.cache, tmp_path / "res")
-    return RingFiles(dat, cache)
-
-
-class Dialogs:
-    """Records the window's error dialogs and answers its questions."""
-
-    def __init__(self) -> None:
-        self.errors: list[tuple[str, str]] = []
-        self.questions: list[str] = []
-        self.answer = True
-
-    def error(self, title: str, text: str) -> None:
-        self.errors.append((title, text))
-
-    def ask(self, title: str, text: str) -> bool:
-        self.questions.append(f"{title}: {text}")
-        return self.answer
-
-
-@pytest.fixture
-def make_window(qtbot: QtBot) -> Iterator[Callable[..., tuple[MainWindow, Dialogs]]]:
-    """Factory of shown main windows (workers=1) with recorded dialogs."""
-
-    def factory(**kwargs: object) -> tuple[MainWindow, Dialogs]:
-        window = MainWindow(workers=1, **kwargs)  # type: ignore[arg-type]
-        qtbot.addWidget(window)
-        dialogs = Dialogs()
-        window._show_error = dialogs.error  # type: ignore[method-assign]
-        window._ask = dialogs.ask  # type: ignore[method-assign]
-        window.show()
-        return window, dialogs
-
-    yield factory
-
-
-def wait_idle(qtbot: QtBot, window: MainWindow) -> None:
-    """Wait until no open/build, Fit All or scatter load is running."""
-    qtbot.waitUntil(lambda: not window.is_busy() and not window.detail_pending, timeout=WAIT_MS)
-
-
-def open_and_wait(qtbot: QtBot, window: MainWindow, path: Path) -> None:
-    assert window.open_path(path, confirm=False)
-    wait_idle(qtbot, window)
-    assert window.session.is_open
-
 
 def test_open_cache_with_results_and_select_from_map(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
 ) -> None:
@@ -153,7 +94,7 @@ def test_open_cache_with_results_and_select_from_map(
 
 
 def test_band_navigation_drives_the_map_silently(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
 ) -> None:
@@ -176,7 +117,7 @@ def test_band_navigation_drives_the_map_silently(
 
 
 def test_rapid_selection_shows_the_last_channel(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
 ) -> None:
@@ -189,8 +130,8 @@ def test_rapid_selection_shows_the_last_channel(
     assert window.scatter.detail.key == window.session.data_channels[7]
 
 
-def test_map_board_without_data_and_phase5_stubs(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+def test_map_board_without_data(
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
 ) -> None:
@@ -200,16 +141,19 @@ def test_map_board_without_data_and_phase5_stubs(
     assert window.session.selection is None
     assert "no events" in window.scatter.message()
     assert "Node 2 Board 20" in window.inspector.title_label.text()
-    window.system_map.fit_channel_requested.emit(ChannelAddress(*CLEAN))
-    assert "phase 5" in window.status_message()
-    window.system_map.fit_board_requested.emit(1, 15)
-    assert "Fit Board arrives in phase 5" in window.status_message()
-    assert not window.export_tec_action.isEnabled() and not window.export_csv_action.isEnabled()
-    assert all(not window.tabs.isTabEnabled(i) for i in range(1, 1 + len(PHASE5_TABS)))
+    assert "no events" in window.radial.message() and "no events" in window.angle.message()
+    assert "no events" in window.board_grid.message() and window.board_grid.board is None
+    # Nothing to re-fit on a board without events; the results can be exported
+    band = window.control_band
+    assert not band.fit_channel_button.isEnabled() and not band.fit_board_button.isEnabled()
+    assert window.export_tec_action.isEnabled() and window.export_csv_action.isEnabled()
+    titles = [window.tabs.tabText(i) for i in range(window.tabs.count())]
+    assert titles == list(TAB_TITLES)
+    assert all(window.tabs.isTabEnabled(i) for i in range(window.tabs.count()))
 
 
 def test_fit_all_stores_results_and_updates_the_map(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     ring_files: RingFiles,
 ) -> None:
@@ -240,7 +184,7 @@ def test_fit_all_stores_results_and_updates_the_map(
 
 
 def test_open_raw_builds_the_cache(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     ring_files: RingFiles,
 ) -> None:
@@ -259,7 +203,7 @@ def test_open_raw_builds_the_cache(
 
 
 def test_open_raw_stop(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     ring_files: RingFiles,
     monkeypatch: pytest.MonkeyPatch,
@@ -298,16 +242,6 @@ def test_open_raw_stop(
     assert window.open_raw_action.isEnabled() and not window.stop_action.isEnabled()
 
 
-def _aim(rect: QRectF, hits: Callable[[QPoint], bool]) -> QPoint:
-    """A pixel of ``rect`` (a cell a few pixels wide) that hit-tests to that cell."""
-    y = round(rect.center().y())
-    for x in range(math.floor(rect.left()), math.ceil(rect.right()) + 1):
-        point = QPoint(x, y)
-        if hits(point):
-            return point
-    raise AssertionError(f"no pixel of {rect} hits the cell")
-
-
 def _assert_in_sync(window: MainWindow, key: ChannelKey) -> None:
     """Band, map, strip, scatter and inspector all show ``key``."""
     band, smap = window.control_band, window.system_map
@@ -329,7 +263,7 @@ def _assert_in_sync(window: MainWindow, key: ChannelKey) -> None:
 
 
 def test_mouse_clicks_on_grid_and_strip_keep_everything_in_sync(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
 ) -> None:
@@ -341,16 +275,7 @@ def test_mouse_clicks_on_grid_and_strip_keep_everything_in_sync(
     assert model is not None
 
     # A grid cell (panel 1 holds nodes 1-5)
-    located = model.locate(OUTLIERS)
-    assert located is not None
-    _, kind, position = located
-    smap.set_view(VIEW_ANODES if kind == "anode" else VIEW_CATHODES)
-    grid = smap.panel_grids[0]
-    point = _aim(
-        grid.cell_rect(OUTLIERS.node, OUTLIERS.board, position),
-        lambda pt: grid.cell_at(pt) == (OUTLIERS.node, OUTLIERS.board, position),
-    )
-    QTest.mouseClick(grid, Qt.MouseButton.LeftButton, pos=point)
+    click_map_cell(window, OUTLIERS)
     wait_idle(qtbot, window)
     _assert_in_sync(window, OUTLIERS)
 
@@ -360,7 +285,7 @@ def test_mouse_clicks_on_grid_and_strip_keep_everything_in_sync(
     assert located is not None
     _, kind, position = located
     strip = smap.board_strip
-    point = _aim(
+    point = aim(
         strip.cell_rect(kind, position),
         lambda pt: (cell := strip.cell_at(pt)) is not None and cell.channel == target,
     )
@@ -380,7 +305,7 @@ def test_mouse_clicks_on_grid_and_strip_keep_everything_in_sync(
 
 
 def test_prev_next_after_a_board_only_selection(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
 ) -> None:
@@ -405,7 +330,7 @@ def test_prev_next_after_a_board_only_selection(
 
 
 def test_channel_without_events_says_no_data(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
 ) -> None:
@@ -421,7 +346,7 @@ def test_channel_without_events_says_no_data(
 
 
 def test_unreadable_results_open_with_a_warning(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
 ) -> None:
@@ -444,7 +369,7 @@ def test_unreadable_results_open_with_a_warning(
 
 
 def test_open_raw_routes_caches_and_refuses_non_raw_files(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
     tmp_path: Path,
@@ -471,7 +396,7 @@ def test_open_raw_routes_caches_and_refuses_non_raw_files(
 
 
 def test_stop_is_disabled_while_opening_a_cache(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
 ) -> None:
@@ -482,7 +407,7 @@ def test_stop_is_disabled_while_opening_a_cache(
 
 
 def test_rebuild_asks_before_discarding_results(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     results_files: RingFiles,
 ) -> None:
     stat = results_files.dat.stat()
@@ -494,9 +419,7 @@ def test_rebuild_asks_before_discarding_results(
     assert window.open_thread is None
 
 
-def test_open_errors_are_reported(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]], tmp_path: Path
-) -> None:
+def test_open_errors_are_reported(make_window: MakeWindow, tmp_path: Path) -> None:
     window, dialogs = make_window()
     assert not window.open_path(tmp_path / "missing.dat")
     assert not window.open_path(tmp_path / "missing.uv.h5")
@@ -505,9 +428,7 @@ def test_open_errors_are_reported(
     assert "Open a raw" in dialogs.errors[-1][1]
 
 
-def test_open_error_from_the_thread(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]], qtbot: QtBot, tmp_path: Path
-) -> None:
+def test_open_error_from_the_thread(make_window: MakeWindow, qtbot: QtBot, tmp_path: Path) -> None:
     bogus = tmp_path / "bogus.uv.h5"
     bogus.write_bytes(b"not hdf5")
     window, dialogs = make_window()
@@ -517,9 +438,7 @@ def test_open_error_from_the_thread(
     assert not window.session.is_open
 
 
-def test_reset_layout_and_settings_round_trip(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]], qtbot: QtBot
-) -> None:
+def test_reset_layout_and_settings_round_trip(make_window: MakeWindow, qtbot: QtBot) -> None:
     window, _ = make_window()
     mode = COLOR_MODES[2]
     window.system_map.color_mode_combo.setCurrentIndex(2)  # the user path (emits)
@@ -544,7 +463,7 @@ def test_reset_layout_and_settings_round_trip(
 
 
 def test_close_stops_a_running_fit_all(
-    make_window: Callable[..., tuple[MainWindow, Dialogs]],
+    make_window: MakeWindow,
     qtbot: QtBot,
     results_files: RingFiles,
     monkeypatch: pytest.MonkeyPatch,

@@ -25,7 +25,7 @@ _SIGNAL_POLL_MS = 250  # how often Python gets to run a pending SIGINT handler
 
 def __getattr__(name: str) -> Any:
     """Lazy access to the window module's public names (``MainWindow``, ...)."""
-    if name in ("MainWindow", "PHASE5_TABS"):
+    if name in ("MainWindow", "TAB_TITLES"):
         from uvcorr.gui import window
 
         return getattr(window, name)

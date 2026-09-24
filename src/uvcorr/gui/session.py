@@ -18,19 +18,21 @@ whose module uses ``QColor``, a value type that needs no ``QApplication``),
 so the session is unit tested without widgets.
 
 Threads and cache access. Opening a file (:func:`load_raw`,
-:func:`load_cache`), the Fit All batch (:meth:`UVSession.run_batch`) and the
-scatter's channel detail (:meth:`UVSession.compute_detail`) are blocking and
-run in the worker threads of :mod:`uvcorr.gui.threads`; everything that
-changes the session's state (:meth:`UVSession.install`,
-:meth:`UVSession.apply_batch`, :meth:`UVSession.store_override`) runs on the
-GUI thread. No HDF5 handle is held between calls (the cache API opens the
-file per call), but in-process read and write handles on one file conflict,
-so every cache access of the session holds one lock (``_io_lock``). The one
-exception is the read-only board loading inside
-:func:`~uvcorr.analysis.analyze_all` (with ``workers=1`` it reads in-process
-without the lock): concurrent reads are safe, and no session write can run
-while a batch is running (:class:`SessionBusyError`). A cache that another
-process holds open for writing raises
+:func:`load_cache`), the Fit All batch (:meth:`UVSession.run_batch`), a
+channel or board re-fit (:meth:`UVSession.run_refit`) and the scatter's
+channel detail (:meth:`UVSession.compute_detail`) are blocking and run in the
+worker threads of :mod:`uvcorr.gui.threads`; everything that changes the
+session's state (:meth:`UVSession.install`, :meth:`UVSession.apply_batch`,
+:meth:`UVSession.apply_refit`, the override reverts) runs on the GUI thread.
+A batch and a re-fit store results, so only one of them runs at a time
+(:class:`SessionBusyError`), and no revert or open can run meanwhile. No HDF5
+handle is held between calls (the cache API opens the file per call), but
+in-process read and write handles on one file conflict, so every cache access
+of the session holds one lock (``_io_lock``). The one exception is the
+read-only board loading inside :func:`~uvcorr.analysis.analyze_all` (with
+``workers=1`` it reads in-process without the lock): concurrent reads are
+safe, and no session write can run while a batch is running. A cache that
+another process holds open for writing raises
 :class:`~uvcorr.cache.CacheBusyError` with a message meant for the user.
 
 Channel detail (the scatter). ``ChannelResult`` does not store which points
@@ -43,10 +45,22 @@ count disagree. The drawn ellipse and correction always use the *stored*
 parameters (what the exports contain). The refit takes ~0.2 s for the
 largest real channel (946k events), which is why it runs in a thread.
 
-Phase 5 hooks: :meth:`UVSession.refit_channel` (compute a channel with given
-options), :meth:`UVSession.store_override` (persist a re-fit; the cache
-requires stored batch results first) and :meth:`UVSession.merged_results`
-(what the exports write).
+Re-fits and overrides (plan D7, 6.1). A channel or board is re-fitted with
+the control band's options (:meth:`UVSession.refit_request` on the GUI
+thread, :meth:`UVSession.run_refit` in a worker, :meth:`UVSession.apply_refit`
+back on the GUI thread). The options are compared with the stored batch
+options: when they differ, the new results are stored as overrides (one
+cache write for a whole board, :meth:`~uvcorr.cache.UVCache.save_overrides`);
+when they are equal, the re-fit reproduces the batch, so the channels'
+overrides are deleted instead (revert to batch) and nothing is stored.
+Re-fits need stored batch results (:class:`~uvcorr.cache.ResultsError`
+otherwise). :meth:`UVSession.revert_overrides`, :meth:`UVSession.revert_board`
+and :meth:`UVSession.clear_overrides` delete overrides directly.
+
+Exports (plan D3): :meth:`UVSession.export_tec`, :meth:`UVSession.export_csv`
+and :meth:`UVSession.export_outputs` write the merged results (batch rows
+with the overrides applied, :meth:`UVSession.merged_results`) through the
+atomic writers of :mod:`uvcorr.io`.
 """
 
 from __future__ import annotations
@@ -54,20 +68,24 @@ from __future__ import annotations
 import bisect
 import logging
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
 import numpy.typing as npt
 
 from uvcorr.analysis import (
     OPTIONS_BATCH,
     OPTIONS_OVERRIDE,
+    AnalysisCancelled,
     ChannelKey,
     ChannelResult,
     analyze_all,
@@ -81,6 +99,7 @@ from uvcorr.cache import (
     BuildSettings,
     ProgressCallback,
     ResultsError,
+    StaleResultsError,
     StopFlag,
     StoredOverride,
     StoredResults,
@@ -92,6 +111,9 @@ from uvcorr.cache import (
 from uvcorr.channels import electrode_label, is_active_channel, polarity_name
 from uvcorr.ellipse import EllipseParams, correct, fit_ellipse
 from uvcorr.gui._system_map_model import ChannelView
+from uvcorr.io.export import output_paths, prepare_output_dir, write_outputs
+from uvcorr.io.summary_csv import write_summary_csv
+from uvcorr.io.tec import write_tec
 from uvcorr.options import (
     FLAG_GAUSS_FIT_FAILED_PRE,
     STATUS_FIT_FAILED,
@@ -109,18 +131,28 @@ __all__ = [
     "BatchOutcome",
     "ChannelDetail",
     "DetailRequest",
+    "ExportSummary",
     "OpenedFile",
     "RawFileCheck",
     "NoEventsError",
+    "RefitOutcome",
+    "RefitRequest",
+    "RevertOutcome",
+    "RevertRequest",
+    "STALE_RESULTS_MESSAGE",
     "SessionBusyError",
     "SessionError",
     "UVSession",
     "channel_view",
     "channel_title",
+    "describe_options_change",
+    "effective_options",
     "inspect_raw",
     "is_cache_file",
     "load_cache",
     "load_raw",
+    "same_fit",
+    "short_title",
 ]
 
 DEFAULT_BOARD_CACHE_SIZE = 4
@@ -159,6 +191,59 @@ BoolArray = npt.NDArray[np.bool_]
 BatchProgressCallback = Callable[[int, int], None]
 """``progress_cb(done, total)`` of :meth:`UVSession.run_batch`, passed through to
 :func:`~uvcorr.analysis.analyze_all` (only the ratio is meaningful to the GUI)."""
+
+
+STALE_RESULTS_MESSAGE = "stored results changed on disk (another process?); reopen the file"
+"""The error when the cache's batch results are not the ones the session loaded."""
+
+
+@contextmanager
+def _stale_as_session_error(cache: UVCache) -> Iterator[None]:
+    """Turn a :class:`~uvcorr.cache.StaleResultsError` into a :class:`SessionError`."""
+    try:
+        yield
+    except StaleResultsError as exc:
+        logger.warning(str(exc))
+        raise SessionError(f"{cache.path.name}: {STALE_RESULTS_MESSAGE}") from exc
+
+
+def _same_file(path: Path, other: Path) -> bool:
+    """Whether two paths name the same file (symbolic or hard links included)."""
+    try:
+        if path.resolve() == other.resolve():
+            return True
+        return path.exists() and other.exists() and os.path.samefile(path, other)
+    except OSError:
+        return False
+
+
+def _export_error(exc: OSError, targets: list[Path]) -> OSError:
+    """An export's OSError, reworded to name the target instead of a temporary file.
+
+    The writers go through hidden temporary files (and the directory check
+    through a probe file), whose names mean nothing to the user.
+    """
+    cause = exc.__cause__ if isinstance(exc.__cause__, OSError) else exc
+    reason = cause.strerror or str(exc)
+    if cause.strerror is None and not cause.filename:
+        return OSError(str(exc))  # already worded for the user (e.g. "... is a directory")
+    names = {str(target) for target in targets}
+    if cause.filename2 is not None and str(cause.filename2) in names:
+        where = str(cause.filename2)
+    elif len(targets) == 1:
+        where = str(targets[0])
+    else:
+        where = f"to the directory {targets[0].parent}"
+    return OSError(f"Cannot write {where}: {reason}")
+
+
+def _stop_callable(stop_flag: StopFlag | None) -> Callable[[], bool]:
+    """A ``stop_flag`` (None, a callable or a ``threading.Event``) as a callable."""
+    if stop_flag is None:
+        return lambda: False
+    if isinstance(stop_flag, threading.Event):
+        return stop_flag.is_set
+    return stop_flag
 
 
 class SessionError(Exception):
@@ -451,10 +536,86 @@ def channel_view(result: ChannelResult) -> ChannelView:
 def channel_title(key: ChannelKey | tuple[int, int, int, int]) -> str:
     """Short channel name, e.g. ``"N2 B16 R0 Ch27 (C04)"`` (electrode when active)."""
     node, board, rena, channel = (int(k) for k in key)
-    text = f"N{node} B{board} R{rena} Ch{channel:02d}"
+    text = short_title((node, board, rena, channel))
     if is_active_channel(rena, channel):
         text += f" ({electrode_label(board, rena, channel)})"
     return text
+
+
+def short_title(key: ChannelKey | tuple[int, int, int, int]) -> str:
+    """Channel name without the electrode, e.g. ``"N2 B16 R0 Ch27"`` (status messages)."""
+    node, board, rena, channel = (int(k) for k in key)
+    return f"N{node} B{board} R{rena} Ch{channel:02d}"
+
+
+def _on_off(value: Any) -> str:
+    return "on" if value else "off"
+
+
+_OPTION_CHANGE_TEXT: dict[str, Callable[[Any], str]] = {
+    "robust": lambda value: f"robust {_on_off(value)}",
+    "clip_k": lambda value: f"clip k {value:g}",
+    "max_iter": lambda value: f"max iter {value}",
+    "geometric": lambda value: f"geometric {_on_off(value)}",
+    "min_events": lambda value: f"min events {value:,}",
+    "phase_ref_freq_hz": lambda value: f"ref freq {value:g} Hz",
+    "high_rejection_frac": lambda value: f"high rejection > {value:g}",
+    "extreme_axis_ratio": lambda value: f"axis ratio < {value:g}",
+    "broad_ring_frac": lambda value: f"broad ring > {value:g}",
+}
+
+
+_DEFAULT_OPTIONS = FitOptions()
+_ROBUST_ONLY = frozenset({"clip_k", "max_iter"})
+
+
+def effective_options(options: FitOptions) -> FitOptions:
+    """The options as the fit uses them.
+
+    Without the robust iteration, ``clip_k`` and ``max_iter`` have no effect
+    (:func:`~uvcorr.ellipse.fit_ellipse`), so they are set to their defaults:
+    two option sets fit identically exactly when their effective options are
+    equal. The override-or-revert decision, the Fit All override check and
+    every description of an options change compare effective options.
+    """
+    if options.robust:
+        return options
+    return replace(options, clip_k=_DEFAULT_OPTIONS.clip_k, max_iter=_DEFAULT_OPTIONS.max_iter)
+
+
+def same_fit(options: FitOptions, other: FitOptions) -> bool:
+    """Whether two option sets fit identically (equal :func:`effective_options`)."""
+    return effective_options(options) == effective_options(other)
+
+
+def describe_options_change(options: FitOptions, reference: FitOptions) -> str:
+    """The effective options that differ from ``reference``, e.g. ``"robust off, clip k 3"``.
+
+    Both sides are compared as :func:`effective_options`, and clip k and
+    max iter are not listed when ``options`` has robust off.
+
+    Returns:
+        The changed options in the control band's order (robust, clip k,
+        max iter, geometric, min events, then the others), or ``""`` when
+        they fit identically.
+    """
+    before = effective_options(reference).to_dict()
+    after = effective_options(options).to_dict()
+    # The control band's order first, then any other option
+    names = [*_OPTION_CHANGE_TEXT, *(name for name in after if name not in _OPTION_CHANGE_TEXT)]
+    if not options.robust:  # clip k and max iter mean nothing without the robust iteration
+        names = [name for name in names if name not in _ROBUST_ONLY]
+    parts: list[str] = []
+    for name in names:
+        value = after[name]
+        if value != before.get(name):
+            text = _OPTION_CHANGE_TEXT.get(name)
+            parts.append(text(value) if text is not None else f"{name} {value}")
+    return ", ".join(parts)
+
+
+def _plural(n: int, noun: str) -> str:
+    return f"{n:,} {noun}" if n == 1 else f"{n:,} {noun}s"
 
 
 # ---------------------------------------------------------------------------
@@ -642,10 +803,13 @@ class BatchOutcome:
 
     Attributes:
         cache_path: The cache the batch ran on.
-        stored: The results as stored after the batch (overrides kept).
+        stored: The results as stored after the batch.
         options: The batch options.
         workers: Worker processes used.
         seconds: Wall time (analysis and storing).
+        keep_overrides: Whether the overrides were kept (else discarded).
+        n_dropped: Stored overrides not carried over: all of them when
+            discarded, else those fitted with the new batch options.
     """
 
     cache_path: Path
@@ -653,6 +817,221 @@ class BatchOutcome:
     options: FitOptions
     workers: int
     seconds: float
+    keep_overrides: bool = True
+    n_dropped: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Re-fits (channel or board) and exports
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class RefitRequest:
+    """A snapshot of what :meth:`UVSession.run_refit` needs (taken on the GUI thread).
+
+    Attributes:
+        cache: The cache to read the events from and store the results in.
+        node, board: The board.
+        channel: The channel of a channel re-fit; None re-fits every channel
+            of the board.
+        options: The fit options (the control band's).
+        stored: The stored results when the re-fit was requested: their
+            batch options decide between storing overrides and reverting.
+    """
+
+    cache: UVCache
+    node: int
+    board: int
+    channel: ChannelKey | None
+    options: FitOptions
+    stored: StoredResults
+
+    @property
+    def is_board(self) -> bool:
+        """Whether the whole board is re-fitted."""
+        return self.channel is None
+
+    @property
+    def title(self) -> str:
+        """``"N2 B16 R0 Ch27"`` for a channel, ``"N2 B16"`` for a board."""
+        if self.channel is not None:
+            return short_title(self.channel)
+        return f"N{self.node} B{self.board}"
+
+    @property
+    def as_override(self) -> bool:
+        """The options fit differently from the batch options: the results become overrides.
+
+        Compared as :func:`effective_options` (with robust off, clip k and
+        max iter do not matter).
+        """
+        return not same_fit(self.options, self.stored.options)
+
+    @property
+    def n_reverted(self) -> int:
+        """Overrides a re-fit with the batch options deletes (0 for an override re-fit)."""
+        if self.as_override:
+            return 0
+        if self.channel is not None:
+            return int(self.channel in self.stored.overrides)
+        return sum(1 for key in self.stored.overrides if (key.node, key.board) == self.board_key)
+
+    @property
+    def board_key(self) -> tuple[int, int]:
+        """``(node, board)``."""
+        return self.node, self.board
+
+    def describe_start(self) -> str:
+        """The status-bar text while it runs, e.g. ``"Fit Channel N2 B16 R0 Ch27 (robust off)…"``."""
+        what = "Fit Board" if self.is_board else "Fit Channel"
+        if self.as_override:
+            change = describe_options_change(self.options, self.stored.options)
+            return f"{what} {self.title} ({change})…"
+        n = self.n_reverted
+        if self.is_board:
+            reverts = f"reverts {_plural(n, 'override')}" if n else "no overrides to revert"
+        else:
+            reverts = "reverts its override" if n else "no override to revert"
+        return f"{what} {self.title} with the batch options ({reverts})…"
+
+
+@dataclass(frozen=True, eq=False)
+class RefitOutcome:
+    """Result of :meth:`UVSession.run_refit` (already stored in the cache).
+
+    Attributes:
+        request: The request.
+        results: The re-fitted results, sorted; ``options_source`` is
+            ``"override"`` for those stored as overrides.
+        stored: The stored results after the re-fit, for
+            :meth:`UVSession.apply_refit`.
+        saved: Channels whose re-fit was stored as an override.
+        removed: Channels whose override was deleted (a re-fit with the
+            batch options reverts to the batch).
+        seconds: Wall time (fitting and storing).
+    """
+
+    request: RefitRequest
+    results: tuple[ChannelResult, ...]
+    stored: StoredResults
+    saved: tuple[ChannelKey, ...]
+    removed: tuple[ChannelKey, ...]
+    seconds: float
+
+    @property
+    def changed(self) -> tuple[ChannelKey, ...]:
+        """Channels whose merged result changed (sorted)."""
+        return tuple(sorted(set(self.saved) | set(self.removed)))
+
+    def describe(self) -> str:
+        """A status-bar summary, e.g. ``"Override saved for N2 B16 R0 Ch27 (robust off)"``."""
+        request = self.request
+        title = request.title
+        if request.as_override:
+            change = describe_options_change(request.options, request.stored.options)
+            if request.is_board:
+                text = f"Overrides saved for the {_plural(len(self.saved), 'channel')} of {title}"
+            else:
+                text = f"Override saved for {title}"
+            text += f" ({change})"
+        else:
+            n_removed = len(self.removed)
+            if n_removed and request.is_board:
+                text = f"{title} reverted to batch ({_plural(n_removed, 'override')} removed)"
+            elif n_removed:
+                text = f"{title} reverted to batch (override removed)"
+            elif request.is_board:
+                text = (
+                    f"{title} re-fitted with the batch options: no overrides to remove, "
+                    "nothing stored"
+                )
+            else:
+                text = (
+                    f"{title} re-fitted with the batch options: it matches the batch, "
+                    "nothing stored"
+                )
+            if self.saved:  # channels without a batch row keep their re-fit
+                text += (
+                    f"; {_plural(len(self.saved), 'channel')} without a batch result "
+                    "stored as override"
+                )
+        return f"{text}; {self.seconds:.1f} s"
+
+
+@dataclass(frozen=True, eq=False)
+class RevertRequest:
+    """Overrides to delete (:meth:`UVSession.revert_request`, taken on the GUI thread).
+
+    Attributes:
+        cache: The cache to write.
+        keys: The channels whose overrides are deleted (sorted, all with an
+            override).
+        stored: The stored results when the revert was requested.
+        title: What is reverted, e.g. ``"N2 B16 R0 Ch27"``, ``"N2 B16"``, or
+            ``""`` for every override.
+    """
+
+    cache: UVCache
+    keys: tuple[ChannelKey, ...]
+    stored: StoredResults
+    title: str
+
+    @property
+    def is_all(self) -> bool:
+        """Whether every override is deleted (Clear All Overrides)."""
+        return not self.title
+
+
+@dataclass(frozen=True, eq=False)
+class RevertOutcome:
+    """Result of :meth:`UVSession.run_revert` (already written to the cache).
+
+    Attributes:
+        request: The request.
+        stored: The stored results after the revert, for
+            :meth:`UVSession.apply_revert`.
+        removed: The channels reverted (sorted).
+        seconds: Wall time.
+    """
+
+    request: RevertRequest
+    stored: StoredResults
+    removed: tuple[ChannelKey, ...]
+    seconds: float
+
+    def describe(self) -> str:
+        """A status-bar summary, e.g. ``"N2 B16 reverted to batch (3 overrides removed)"``."""
+        request = self.request
+        removed = _plural(len(self.removed), "override")
+        if request.is_all:
+            return f"All overrides cleared ({removed} removed; the channels are back to batch)"
+        if len(request.keys) == 1 and request.title == short_title(request.keys[0]):
+            return f"{request.title} reverted to batch (override removed)"
+        return f"{request.title} reverted to batch ({removed} removed)"
+
+
+@dataclass(frozen=True)
+class ExportSummary:
+    """What an export wrote (:meth:`UVSession.export_tec` and friends).
+
+    Attributes:
+        paths: The files written.
+        n_rows: Channels in the results (CSV rows).
+        n_ok: ``ok`` channels (``.tec`` blocks).
+        n_overrides: Channels whose row comes from an override.
+        seconds: Wall time of formatting and writing.
+        warning: Set when the results stored in the cache changed on disk
+            since they were loaded (the export wrote the results the session
+            holds); empty otherwise.
+    """
+
+    paths: tuple[Path, ...]
+    n_rows: int
+    n_ok: int
+    n_overrides: int
+    seconds: float
+    warning: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +1054,9 @@ class UVSession:
             raise ValueError(f"board_cache_size must be >= 1, got {board_cache_size}")
         self._board_cache_size = board_cache_size
         self._io_lock = threading.RLock()
+        # Held while Fit All or a re-fit runs (both store results); _busy_label names it.
         self._batch_lock = threading.Lock()
+        self._busy_label: str | None = None
         self._boards_lru: OrderedDict[tuple[str, int, int], BoardUV] = OrderedDict()
         self._opened: OpenedFile | None = None
         self._stored: StoredResults | None = None
@@ -744,8 +1125,27 @@ class UVSession:
 
     @property
     def batch_running(self) -> bool:
-        """Whether :meth:`run_batch` is running."""
+        """Whether :meth:`run_batch` or :meth:`run_refit` is running (both store results)."""
         return self._batch_lock.locked()
+
+    def _busy_text(self) -> str:
+        return f"{self._busy_label or 'Fit All'} is running"
+
+    @contextmanager
+    def _exclusive(self, label: str) -> Iterator[None]:
+        """Hold the batch lock while a batch or re-fit runs (``label`` names it in errors)."""
+        if not self._batch_lock.acquire(blocking=False):
+            raise SessionBusyError(f"{self._busy_text()}; wait for it to finish")
+        self._busy_label = label
+        try:
+            yield
+        finally:
+            self._busy_label = None
+            self._batch_lock.release()
+
+    def _check_not_busy(self, what: str) -> None:
+        if self.batch_running:
+            raise SessionBusyError(f"{self._busy_text()}; wait for it to finish before {what}")
 
     # ------------------------------------------------------------------
     # Open / close
@@ -758,10 +1158,10 @@ class UVSession:
         without results) and the selection is cleared.
 
         Raises:
-            SessionBusyError: If a batch is running on the current file.
+            SessionBusyError: If a batch or re-fit is running on the current file.
         """
         if self.batch_running:
-            raise SessionBusyError("Fit All is running; stop it before opening another file")
+            raise SessionBusyError(f"{self._busy_text()}; stop it before opening another file")
         self._opened = opened
         self._channels = tuple(opened.channel_counts)
         self._set_stored(opened.stored)
@@ -773,7 +1173,7 @@ class UVSession:
     def close(self) -> None:
         """Forget the open file, results, selection and loaded boards."""
         if self.batch_running:
-            raise SessionBusyError("Fit All is running; stop it before closing the file")
+            raise SessionBusyError(f"{self._busy_text()}; stop it before closing the file")
         self._opened = None
         self._channels = ()
         self._set_stored(None)
@@ -890,6 +1290,43 @@ class UVSession:
         """The System Map views of every result."""
         return {key: channel_view(result) for key, result in self._merged.items()}
 
+    def view(self, key: ChannelKey | tuple[int, int, int, int]) -> ChannelView | None:
+        """The System Map view of one channel's merged result, or None without a result."""
+        result = self.result(key)
+        return channel_view(result) if result is not None else None
+
+    def override_keys(self, node: int | None = None, board: int | None = None) -> list[ChannelKey]:
+        """Channels with an override, sorted: all of them, or those of one board."""
+        stored = self._stored
+        if stored is None:
+            return []
+        keys = list(stored.overrides)
+        if node is not None and board is not None:
+            keys = [key for key in keys if (key.node, key.board) == (node, board)]
+        return sorted(keys)
+
+    def override_options(self, key: ChannelKey | tuple[int, int, int, int]) -> FitOptions | None:
+        """The options of a channel's override, or None if it has none."""
+        stored = self._stored
+        if stored is None:
+            return None
+        override = stored.overrides.get(ChannelKey(*(int(k) for k in key)))
+        return override.options if override is not None else None
+
+    def override_change(self, key: ChannelKey | tuple[int, int, int, int]) -> str | None:
+        """How a channel's override options differ from the batch options (e.g. ``"robust off"``).
+
+        Returns:
+            None if the channel has no override; ``"batch options"`` for an
+            override fitted with options equal to the current batch options
+            (e.g. after a Fit All with those options that kept it).
+        """
+        options = self.override_options(key)
+        stored = self._stored
+        if options is None or stored is None:
+            return None
+        return describe_options_change(options, stored.options) or "batch options"
+
     # ------------------------------------------------------------------
     # Event data (blocking; any thread)
     # ------------------------------------------------------------------
@@ -979,6 +1416,7 @@ class UVSession:
         self,
         options: FitOptions,
         *,
+        keep_overrides: bool = True,
         workers: int | None = None,
         progress_cb: BatchProgressCallback | None = None,
         stop_flag: StopFlag | None = None,
@@ -987,12 +1425,15 @@ class UVSession:
 
         Runs :func:`~uvcorr.analysis.analyze_all` (a ``spawn`` process pool
         unless ``workers`` is 1), then stores the results as the new
-        ``/results/current``, keeping the overrides, and reads them back.
-        Does not change the session: pass the outcome to
+        ``/results/current``, keeping or discarding the overrides, and reads
+        them back. Kept overrides fitted with the new batch options
+        (:func:`same_fit`) are dropped in the same write: the new batch rows
+        reproduce them. Does not change the session: pass the outcome to
         :meth:`apply_batch` on the GUI thread.
 
         Args:
             options: Batch fit options.
+            keep_overrides: Keep the stored overrides (else they are discarded).
             workers: Worker processes (default
                 :func:`~uvcorr.analysis.default_workers`).
             progress_cb: ``progress_cb(done, total)``, as ``analyze_all`` reports it.
@@ -1000,7 +1441,7 @@ class UVSession:
 
         Raises:
             SessionError: If no file is open.
-            SessionBusyError: If a batch is already running.
+            SessionBusyError: If a batch or re-fit is already running.
             AnalysisCancelled: If ``stop_flag`` stopped it (nothing is stored).
             AnalysisError: If a board failed.
             CacheBusyError: If another process holds the cache's lock.
@@ -1008,16 +1449,19 @@ class UVSession:
         cache = self.cache
         if cache is None:
             raise SessionError("No file is open")
-        if not self._batch_lock.acquire(blocking=False):
-            raise SessionBusyError("Fit All is already running")
-        try:
+        with self._exclusive("Fit All"):
             t_start = time.perf_counter()
             n_workers = default_workers() if workers is None else int(workers)
             results = analyze_all(
                 cache, options, workers=n_workers, progress_cb=progress_cb, stop_flag=stop_flag
             )
             with self._io_lock:
-                cache.save_results(results, options, keep_overrides=True)
+                n_dropped = cache.save_results(
+                    results,
+                    options,
+                    keep_overrides=keep_overrides,
+                    drop_overrides=lambda _key, used: same_fit(used, options),
+                )
                 stored = cache.load_results()
             if stored is None:  # pragma: no cover - save_results just wrote them
                 raise ResultsError(f"{cache.path}: the saved results could not be read back")
@@ -1027,9 +1471,9 @@ class UVSession:
                 options=options,
                 workers=n_workers,
                 seconds=time.perf_counter() - t_start,
+                keep_overrides=keep_overrides,
+                n_dropped=n_dropped,
             )
-        finally:
-            self._batch_lock.release()
 
     def apply_batch(self, outcome: BatchOutcome) -> dict[ChannelKey, ChannelView]:
         """Install the results of a finished batch (GUI thread); returns the new map views.
@@ -1046,7 +1490,479 @@ class UVSession:
         return self.views()
 
     # ------------------------------------------------------------------
-    # Phase 5 hooks: single-channel re-fits and overrides
+    # Re-fits (request on the GUI thread, run in a worker, apply on the GUI thread)
+    # ------------------------------------------------------------------
+
+    def refit_request(
+        self,
+        options: FitOptions,
+        *,
+        channel: ChannelKey | tuple[int, int, int, int] | None = None,
+        board: tuple[int, int] | None = None,
+    ) -> RefitRequest:
+        """Snapshot a channel or board re-fit for :meth:`run_refit` (GUI thread).
+
+        Args:
+            options: The fit options.
+            channel: The channel to re-fit, or
+            board: ``(node, board)`` to re-fit every channel of the board.
+
+        Raises:
+            ValueError: Unless exactly one of ``channel`` and ``board`` is given.
+            SessionError: If no file is open, or the channel or board has no
+                events.
+            SessionBusyError: If a batch or re-fit is running.
+            ResultsError: If there are no stored batch results (the re-fit
+                would have nothing to override: run Fit All first).
+        """
+        if (channel is None) == (board is None):
+            raise ValueError("refit_request needs a channel or a board, not both")
+        cache = self.cache
+        if cache is None:
+            raise SessionError("No file is open")
+        self._check_not_busy("re-fitting")
+        stored = self._stored
+        if stored is None:
+            raise ResultsError(
+                "Re-fits are stored as overrides of the batch results: run Fit All first"
+            )
+        if channel is not None:
+            key = ChannelKey(*(int(k) for k in channel))
+            if self.channel_count(key) == 0:
+                raise SessionError(f"{short_title(key)} has no events to fit")
+            return RefitRequest(cache, key.node, key.board, key, options, stored)
+        node, board_number = (int(k) for k in board)  # type: ignore[union-attr]
+        if not self.channels_on_board(node, board_number):
+            raise SessionError(f"N{node} B{board_number} has no events to fit")
+        return RefitRequest(cache, node, board_number, None, options, stored)
+
+    def run_refit(
+        self,
+        request: RefitRequest,
+        *,
+        progress_cb: BatchProgressCallback | None = None,
+        stop_flag: StopFlag | None = None,
+    ) -> RefitOutcome:
+        """Re-fit a channel or board in-process and store the outcome (blocking).
+
+        Each channel is fitted with :func:`~uvcorr.analysis.analyze_channel`
+        (a board is loaded once, through the session's board cache, and its
+        channels are fitted one by one, as
+        :func:`~uvcorr.analysis.analyze_board` does). Then:
+
+        - options different from the batch options: the results are stored
+          as overrides, in one cache write;
+        - options that fit like the batch options (:func:`same_fit`): the
+          re-fit reproduces the batch, so the channels' overrides are
+          deleted and nothing is stored. (A channel without a batch row,
+          which only results written by a newer uvcorr can leave, keeps its
+          re-fit as an override, in the same write.)
+
+        The write checks that the stored batch is still the one the request
+        saw (another process may have replaced it).
+
+        Does not change the session: pass the outcome to :meth:`apply_refit`
+        on the GUI thread.
+
+        Args:
+            request: From :meth:`refit_request`.
+            progress_cb: ``progress_cb(channels_done, channels_total)``.
+            stop_flag: Stop request (callable or ``threading.Event``), checked
+                before each channel and once more before storing.
+
+        Raises:
+            SessionBusyError: If a batch or another re-fit is running.
+            AnalysisCancelled: If ``stop_flag`` stopped it (nothing is stored).
+            KeyError, CacheBusyError: See :meth:`board_data`.
+            SessionError: If the stored results changed on disk since the
+                request (nothing is written).
+        """
+        should_stop = _stop_callable(stop_flag)
+        with self._exclusive("A re-fit"):
+            t_start = time.perf_counter()
+            fitted = self._fit_request(request, progress_cb, should_stop)
+            stored = request.stored
+            options = request.options
+            if request.as_override:
+                to_save = fitted
+                to_remove: list[ChannelKey] = []
+            else:
+                batch_keys = {result.key for result in stored.results}
+                to_save = [result for result in fitted if result.key not in batch_keys]
+                to_remove = [
+                    result.key
+                    for result in fitted
+                    if result.key in batch_keys and result.key in stored.overrides
+                ]
+            saved = [replace(result, options_source=OPTIONS_OVERRIDE) for result in to_save]
+            if should_stop():
+                raise AnalysisCancelled(f"Re-fit of {request.title} cancelled")
+            with self._io_lock, _stale_as_session_error(request.cache):
+                request.cache.replace_overrides(
+                    saved,
+                    options,
+                    to_remove,
+                    expected_created_at=request.stored.created_at,
+                )
+            overrides = {k: v for k, v in stored.overrides.items() if k not in set(to_remove)}
+            for result in saved:
+                overrides[result.key] = StoredOverride(result, options)
+            by_key = {result.key: result for result in [*fitted, *saved]}
+            return RefitOutcome(
+                request=request,
+                results=tuple(by_key[key] for key in sorted(by_key)),
+                stored=replace(stored, overrides=dict(sorted(overrides.items()))),
+                saved=tuple(result.key for result in saved),
+                removed=tuple(sorted(to_remove)),
+                seconds=time.perf_counter() - t_start,
+            )
+
+    def _fit_request(
+        self,
+        request: RefitRequest,
+        progress_cb: BatchProgressCallback | None,
+        should_stop: Callable[[], bool],
+    ) -> list[ChannelResult]:
+        """Fit the channel or every active channel of the board of ``request``."""
+        report = progress_cb if progress_cb is not None else (lambda _done, _total: None)
+        if request.channel is not None:
+            report(0, 1)
+            u, v = self.channel_data(request.channel, request.cache)
+            if should_stop():
+                raise AnalysisCancelled(f"Re-fit of {request.title} cancelled")
+            result = analyze_channel(request.channel, u, v, request.options)
+            report(1, 1)
+            return [result]
+        data = self.board_data(request.node, request.board, request.cache)
+        channels = [(r, c) for r, c, _n in data.channels() if is_active_channel(r, c)]
+        results: list[ChannelResult] = []
+        report(0, len(channels))
+        for done, (rena, channel) in enumerate(channels, start=1):
+            if should_stop():
+                raise AnalysisCancelled(f"Re-fit of {request.title} cancelled")
+            u, v = data.channel_data(rena, channel)
+            key = ChannelKey(request.node, request.board, rena, channel)
+            results.append(analyze_channel(key, u, v, request.options))
+            report(done, len(channels))
+        return results
+
+    def apply_refit(self, outcome: RefitOutcome) -> tuple[ChannelKey, ...]:
+        """Install a finished re-fit (GUI thread).
+
+        Returns:
+            The channels whose merged result changed (see :meth:`view`).
+
+        Raises:
+            SessionError: If the session has since switched to another cache,
+                or its stored results changed while the re-fit ran.
+        """
+        self._check_current(outcome.request.cache, outcome.request.stored, "re-fit")
+        self._set_stored(outcome.stored)
+        return outcome.changed
+
+    # ------------------------------------------------------------------
+    # Reverting overrides (GUI thread)
+    # ------------------------------------------------------------------
+
+    def revert_request(
+        self,
+        keys: Iterable[ChannelKey | tuple[int, int, int, int]] | None = None,
+        *,
+        board: tuple[int, int] | None = None,
+        title: str | None = None,
+    ) -> RevertRequest | None:
+        """Snapshot a revert for :meth:`run_revert` (GUI thread).
+
+        Args:
+            keys: The channels to revert; None with no ``board``: every
+                override (Clear All Overrides).
+            board: ``(node, board)``: every override of the board.
+            title: What is reverted, for the status bar (default: the
+                channel, the board, or "" for every override).
+
+        Returns:
+            The request, or None if none of the channels has an override.
+
+        Raises:
+            SessionError: If no file is open.
+            SessionBusyError: If a batch or re-fit is running.
+        """
+        cache = self.cache
+        if cache is None:
+            raise SessionError("No file is open")
+        self._check_not_busy("reverting overrides")
+        stored = self._stored
+        if stored is None:
+            return None
+        if board is not None:
+            node, board_number = (int(k) for k in board)
+            doomed = self.override_keys(node, board_number)
+            default_title = f"N{node} B{board_number}"
+        elif keys is not None:
+            wanted = {ChannelKey(*(int(k) for k in key)) for key in keys}
+            doomed = sorted(key for key in stored.overrides if key in wanted)
+            default_title = short_title(doomed[0]) if len(wanted) == 1 and doomed else "channels"
+        else:
+            doomed = sorted(stored.overrides)
+            default_title = ""
+        if not doomed:
+            return None
+        return RevertRequest(
+            cache, tuple(doomed), stored, default_title if title is None else title
+        )
+
+    def run_revert(self, request: RevertRequest) -> RevertOutcome:
+        """Delete the overrides of a :class:`RevertRequest` in one cache write (blocking).
+
+        Runs in a worker thread (a busy file can take a second). Checks that
+        the stored batch is still the one the request saw. Does not change
+        the session: pass the outcome to :meth:`apply_revert`.
+
+        Raises:
+            SessionBusyError: If a batch or re-fit is running.
+            SessionError: If the stored results changed on disk (nothing is
+                written).
+            CacheBusyError: If another process holds the cache's lock.
+        """
+        with self._exclusive("A revert"):
+            t_start = time.perf_counter()
+            expected = request.stored.created_at
+            with self._io_lock, _stale_as_session_error(request.cache):
+                if request.is_all:
+                    n_deleted = request.cache.clear_overrides(expected_created_at=expected)
+                else:
+                    n_deleted = request.cache.delete_overrides(
+                        request.keys, expected_created_at=expected
+                    )
+            if n_deleted != len(request.keys):
+                logger.warning(
+                    f"Reverting {len(request.keys)} override(s) deleted {n_deleted} from "
+                    f"{request.cache.path}"
+                )
+            doomed = set(request.keys)
+            overrides = {k: v for k, v in request.stored.overrides.items() if k not in doomed}
+            return RevertOutcome(
+                request=request,
+                stored=replace(request.stored, overrides=overrides),
+                removed=request.keys,
+                seconds=time.perf_counter() - t_start,
+            )
+
+    def apply_revert(self, outcome: RevertOutcome) -> tuple[ChannelKey, ...]:
+        """Install a finished revert (GUI thread); returns the channels reverted.
+
+        Raises:
+            SessionError: As :meth:`apply_refit`.
+        """
+        self._check_current(outcome.request.cache, outcome.request.stored, "revert")
+        self._set_stored(outcome.stored)
+        return outcome.removed
+
+    def _check_current(self, cache: UVCache, stored: StoredResults, what: str) -> None:
+        """Refuse to apply an outcome computed for other results than the session holds."""
+        current = self.cache
+        if current is None or current.path != cache.path:
+            raise SessionError(f"The {what} ran on {cache.path}, which is no longer the open cache")
+        if self._stored is not stored:
+            raise SessionError(
+                f"The stored results changed while the {what} ran; reopen the file to see its "
+                "overrides"
+            )
+
+    def revert_overrides(
+        self, keys: Iterable[ChannelKey | tuple[int, int, int, int]]
+    ) -> tuple[ChannelKey, ...]:
+        """Delete the overrides of some channels now (request, run and apply in one call).
+
+        Channels without an override are ignored. The GUI runs
+        :meth:`run_revert` in a worker thread instead.
+
+        Returns:
+            The channels reverted, sorted.
+
+        Raises:
+            SessionError, SessionBusyError, CacheBusyError: See
+            :meth:`revert_request` and :meth:`run_revert`.
+        """
+        request = self.revert_request(list(keys))
+        return () if request is None else self.apply_revert(self.run_revert(request))
+
+    def revert_board(self, node: int, board: int) -> tuple[ChannelKey, ...]:
+        """Delete every override of a board now (see :meth:`revert_overrides`)."""
+        request = self.revert_request(board=(node, board))
+        return () if request is None else self.apply_revert(self.run_revert(request))
+
+    def clear_overrides(self) -> tuple[ChannelKey, ...]:
+        """Delete every override now, in one cache write; returns the channels reverted."""
+        request = self.revert_request()
+        return () if request is None else self.apply_revert(self.run_revert(request))
+
+    def overrides_fitting_like(self, options: FitOptions) -> list[ChannelKey]:
+        """Overrides whose options fit like ``options`` (a Fit All with them drops these)."""
+        stored = self._stored
+        if stored is None:
+            return []
+        return sorted(key for key, o in stored.overrides.items() if same_fit(o.options, options))
+
+    def results_changed_on_disk(self) -> bool:
+        """Whether the cache's batch results are not the ones the session loaded.
+
+        Raises:
+            CacheBusyError: If another process holds the cache's lock.
+        """
+        cache = self.cache
+        if cache is None:
+            return False
+        expected = self._stored.created_at if self._stored is not None else None
+        with self._io_lock:
+            return cache.results_created_at() != expected
+
+    # ------------------------------------------------------------------
+    # Exports (GUI thread; the writes are atomic)
+    # ------------------------------------------------------------------
+
+    @property
+    def export_stem(self) -> str:
+        """Name stem of the ``.tec`` file: the raw file's stem (``data_…_120628``).
+
+        When no raw path is known, the cache name without ``.uv.h5`` and the
+        raw file's extension.
+        """
+        dat = self.dat_path
+        if dat is not None:
+            return dat.stem
+        cache = self.cache
+        if cache is None:
+            raise SessionError("No file is open")
+        name = cache.path.name
+        if name.endswith(CACHE_SUFFIX):
+            name = name[: -len(CACHE_SUFFIX)]
+        return Path(name).stem or cache.path.stem
+
+    def _export_rows(self) -> list[ChannelResult]:
+        if self.cache is None:
+            raise SessionError("No file is open")
+        if self._stored is None:
+            raise SessionError("Nothing to export: run Fit All first")
+        return self.merged_results()
+
+    def check_export_target(self, path: str | Path) -> None:
+        """Refuse an export target that would destroy data.
+
+        The open raw file and the open cache (also through another name), any
+        existing HDF5 file (a UV cache) and any existing ``.dat`` file are
+        refused: the exports replace their target.
+
+        Raises:
+            SessionError: With the reason.
+        """
+        target = Path(path)
+        opened = [(self.dat_path, "the open raw data file"), (self.cache_path, "the open UV cache")]
+        for other, what in opened:
+            if other is not None and _same_file(target, other):
+                raise SessionError(f"Refusing to overwrite {what} {other} with an export")
+        if not target.is_file():
+            return
+        if target.suffix.lower() == ".dat":
+            raise SessionError(
+                f"Refusing to overwrite {target}: it is a raw .dat file; choose another name"
+            )
+        try:
+            is_hdf5 = bool(h5py.is_hdf5(target))
+        except OSError:  # unreadable: the write reports it
+            is_hdf5 = False
+        if is_hdf5:
+            raise SessionError(
+                f"Refusing to overwrite {target}: it is an HDF5 file (a UV cache?); "
+                "choose another name"
+            )
+
+    @property
+    def cache_path(self) -> Path | None:
+        """The open cache's path."""
+        cache = self.cache
+        return cache.path if cache is not None else None
+
+    def _stale_warning(self) -> str:
+        """A warning if the cache's results changed on disk since they were loaded."""
+        try:
+            changed = self.results_changed_on_disk()
+        except (UVCacheError, OSError) as exc:
+            logger.warning(f"Could not check the stored results before exporting: {exc}")
+            return ""
+        if not changed:
+            return ""
+        name = self.cache_path.name if self.cache_path is not None else "the cache"
+        return (
+            f"The results stored in {name} changed on disk since they were loaded (another "
+            "process?). The export holds the results shown in this window; reopen the file "
+            "to see the new ones."
+        )
+
+    def _export(
+        self, targets: list[Path], write: Callable[[list[ChannelResult]], Iterable[Path]]
+    ) -> ExportSummary:
+        t_start = time.perf_counter()
+        rows = self._export_rows()
+        for target in targets:
+            self.check_export_target(target)
+        warning = self._stale_warning()
+        try:
+            paths = tuple(write(rows))
+        except OSError as exc:
+            raise _export_error(exc, targets) from exc
+        return ExportSummary(
+            paths=paths,
+            n_rows=len(rows),
+            n_ok=sum(1 for row in rows if row.ok),
+            n_overrides=sum(1 for row in rows if row.options_source == OPTIONS_OVERRIDE),
+            seconds=time.perf_counter() - t_start,
+            warning=warning,
+        )
+
+    def export_tec(self, path: str | Path) -> ExportSummary:
+        """Write the merged results' ``.tec`` file (the ``ok`` channels) to ``path``.
+
+        Raises:
+            SessionError: If there are no results, or the target is refused
+                (:meth:`check_export_target`).
+            ValueError: See :func:`~uvcorr.io.tec.write_tec`.
+            OSError: If the file cannot be written (the message names ``path``).
+        """
+        target = Path(path)
+        return self._export([target], lambda rows: [write_tec(target, rows)])
+
+    def export_csv(self, path: str | Path) -> ExportSummary:
+        """Write the merged results' ``radial_summary.csv`` to ``path``.
+
+        Raises:
+            SessionError, OSError: As :meth:`export_tec`.
+        """
+        target = Path(path)
+        return self._export([target], lambda rows: [write_summary_csv(target, rows)])
+
+    def export_outputs(self, directory: str | Path) -> ExportSummary:
+        """Write ``<stem>.tec`` and ``radial_summary.csv`` to ``directory`` (created if needed).
+
+        Both files are replaced together (:func:`~uvcorr.io.export.write_outputs`).
+
+        Raises:
+            SessionError: If there are no results, or a target is refused.
+            ValueError: See :func:`~uvcorr.io.export.write_outputs`.
+            OSError: If the files cannot be written (the message names the
+                directory or file, not a temporary file).
+        """
+        stem = self.export_stem
+        folder = Path(directory)
+
+        def write(rows: list[ChannelResult]) -> Iterable[Path]:
+            prepare_output_dir(folder, stem)
+            return write_outputs(folder, stem, rows)
+
+        return self._export([*output_paths(folder, stem)], write)
+
+    # ------------------------------------------------------------------
+    # Single-channel re-fit and override (lower-level helpers)
     # ------------------------------------------------------------------
 
     def refit_channel(
@@ -1081,7 +1997,7 @@ class UVSession:
 
         Raises:
             SessionError: If no file is open.
-            SessionBusyError: If a batch is running.
+            SessionBusyError: If a batch or re-fit is running.
             ResultsError: If there are no stored batch results to attach the
                 override to (run Fit All first).
             CacheBusyError: If another process holds the cache's lock.
@@ -1089,8 +2005,7 @@ class UVSession:
         cache = self.cache
         if cache is None:
             raise SessionError("No file is open")
-        if self.batch_running:
-            raise SessionBusyError("Fit All is running; wait for it to finish")
+        self._check_not_busy("storing an override")
         stored = self._stored
         if stored is None:
             raise ResultsError("Overrides need stored batch results: run Fit All first")

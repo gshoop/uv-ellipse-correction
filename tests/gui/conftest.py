@@ -27,6 +27,9 @@ never read or overwrite the developer's real ``~/.config`` files, and tests
 never see each other's settings.
 
 ``QT_QPA_PLATFORM=offscreen`` is set by the top-level ``tests/conftest.py``.
+
+The main-window fixtures (``make_window``, ``results_files``) are shared by
+the window tests; their helpers live in ``window_helpers.py``.
 """
 
 from __future__ import annotations
@@ -37,6 +40,11 @@ from pathlib import Path
 
 import pytest
 from PyQt6.QtCore import QCoreApplication, QEvent, QSettings
+from pytestqt.qtbot import QtBot
+
+from tests.conftest import RingFiles
+from tests.gui.ring_cache import copy_files, store_batch_results
+from tests.gui.window_helpers import Dialogs, MakeWindow
 
 
 @pytest.fixture(scope="package", autouse=True)
@@ -92,3 +100,43 @@ def _isolated_qsettings(tmp_path: Path) -> None:
     QSettings.setPath(
         QSettings.Format.IniFormat, QSettings.Scope.SystemScope, str(tmp_path / "system")
     )
+
+
+# ---------------------------------------------------------------------------
+# Main-window fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def _gui_results_master(
+    tmp_path_factory: pytest.TempPathFactory, _ring_files_master: RingFiles
+) -> RingFiles:
+    """The ring files with stored batch results (default options); never modified."""
+    dat, cache = copy_files(
+        _ring_files_master.dat, _ring_files_master.cache, tmp_path_factory.mktemp("gui-results")
+    )
+    store_batch_results(cache)
+    return RingFiles(dat, cache)
+
+
+@pytest.fixture
+def results_files(tmp_path: Path, _gui_results_master: RingFiles) -> RingFiles:
+    """A private copy of the ring ``.dat`` and its cache with stored batch results."""
+    dat, cache = copy_files(_gui_results_master.dat, _gui_results_master.cache, tmp_path / "res")
+    return RingFiles(dat, cache)
+
+
+@pytest.fixture
+def make_window(qtbot: QtBot) -> Iterator[MakeWindow]:
+    """Factory of shown main windows (``workers=1``) with recorded dialogs."""
+    from uvcorr.gui.window import MainWindow
+
+    def factory(**kwargs: object) -> tuple[MainWindow, Dialogs]:
+        window = MainWindow(workers=1, **kwargs)  # type: ignore[arg-type]
+        qtbot.addWidget(window)
+        dialogs = Dialogs()
+        dialogs.install(window)
+        window.show()
+        return window, dialogs
+
+    yield factory

@@ -6,7 +6,8 @@ Implements plan sections 4.4 and 5.3:
   radial and residual statistics (method below).
 - ``radial_stats``: the Gaussian stats plus unbinned sample, robust and shape
   statistics of a set of radii. ``radial_fit_detail`` returns exactly what it
-  fitted (histogram and curve), for plotting.
+  fitted (histogram and curve), for plotting; ``radial_stats_and_detail``
+  returns both from one fit.
 - ``residual_stats``: the Gaussian stats of residuals (the raw residual to the
   ellipse or the corrected residual, see ``uvcorr.ellipse``);
   ``residual_fit_detail`` is its plotting counterpart.
@@ -598,8 +599,14 @@ def residual_fit_detail(
     return gauss_fit_histogram(res, min_bin_width)
 
 
-def radial_stats(r: npt.ArrayLike, min_bin_width: float | None = ADC_MIN_BIN_WIDTH) -> RadialStats:
-    """Statistics of a set of radii (pre- or post-correction, plan 5.3).
+def radial_stats_and_detail(
+    r: npt.ArrayLike, min_bin_width: float | None = ADC_MIN_BIN_WIDTH
+) -> tuple[RadialStats, GaussFitDetail]:
+    """``radial_stats`` and the ``radial_fit_detail`` behind it, from one Gaussian fit.
+
+    ``radial_stats`` is this function's first element, so a plot of the
+    returned histogram and curve always shows exactly the fit whose numbers
+    are reported (the GUI radial tab uses it to fit only once).
 
     Args:
         r: Radii. Non-finite values are ignored.
@@ -607,16 +614,16 @@ def radial_stats(r: npt.ArrayLike, min_bin_width: float | None = ADC_MIN_BIN_WID
             of 1 ADC suits int16 U/V data.
 
     Returns:
-        The Gaussian stats (from ``radial_fit_detail``) plus the unbinned
-        sample mean/std, robust sigma, skewness and excess kurtosis. Never
-        raises or warns.
+        ``(stats, detail)`` with ``stats.gauss == detail.stats``. Never raises
+        or warns.
     """
     vals = _finite_values(r)
     _, robust_sigma = _median_and_robust_sigma(vals)
     sample_mean, sample_std = _sample_mean_std(vals)
     skew, kurt = _shape_stats(vals)
-    g = radial_fit_detail(vals, min_bin_width).stats
-    return RadialStats(
+    detail = radial_fit_detail(vals, min_bin_width)
+    g = detail.stats
+    stats = RadialStats(
         mean=g.mean,
         sigma=g.sigma,
         fwhm=g.fwhm,
@@ -628,6 +635,24 @@ def radial_stats(r: npt.ArrayLike, min_bin_width: float | None = ADC_MIN_BIN_WID
         skewness=skew,
         kurtosis=kurt,
     )
+    return stats, detail
+
+
+def radial_stats(r: npt.ArrayLike, min_bin_width: float | None = ADC_MIN_BIN_WIDTH) -> RadialStats:
+    """Statistics of a set of radii (pre- or post-correction, plan 5.3).
+
+    Args:
+        r: Radii. Non-finite values are ignored.
+        min_bin_width: Bin-width floor for the Gaussian routine; the default
+            of 1 ADC suits int16 U/V data.
+
+    Returns:
+        The Gaussian stats (from ``radial_fit_detail``) plus the unbinned
+        sample mean/std, robust sigma, skewness and excess kurtosis. Never
+        raises or warns. (:func:`radial_stats_and_detail` also returns the
+        fitted histogram.)
+    """
+    return radial_stats_and_detail(r, min_bin_width)[0]
 
 
 def residual_stats(

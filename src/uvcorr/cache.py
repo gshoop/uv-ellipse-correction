@@ -40,8 +40,16 @@ Results: ``save_results`` writes a complete new group ``/results/_new`` and
 only then swaps it in (``current`` -> ``_old``, ``_new`` -> ``current``,
 delete ``_old``), so an exception part-way through leaves the previous
 ``current`` intact. The overrides table is replaced the same way
-(``table_new`` -> ``table``). Readers ignore leftover ``_new`` groups and fall
-back to ``_old`` if a swap was interrupted; the next write cleans both up.
+(``table_new`` -> ``table``), once per call however many overrides the call
+stores or deletes (:meth:`UVCache.replace_overrides`, which
+:meth:`UVCache.save_overrides` and :meth:`UVCache.delete_overrides` use).
+The override writes take an optional ``expected_created_at``: the
+``created_at`` of the batch results the caller loaded, checked under the
+write handle, so a caller holding results that another process has since
+replaced gets a :class:`StaleResultsError` instead of writing into the new
+results. Readers ignore leftover ``_new`` groups
+and fall back to ``_old`` if a swap was interrupted; the next write cleans
+both up.
 This protects against errors and ordinary interruptions, not against power
 loss or a process killed inside an HDF5 call: HDF5 files are not journaled, so
 such a crash can corrupt the file (the cache can always be rebuilt from the
@@ -112,6 +120,7 @@ __all__ = [
     "InsufficientDiskSpaceError",
     "ProgressCallback",
     "ResultsError",
+    "StaleResultsError",
     "StopFlag",
     "StoredOverride",
     "StoredResults",
@@ -210,6 +219,15 @@ class CacheBusyError(UVCacheError):
 
 class ResultsError(UVCacheError):
     """Stored results are missing where required, or unreadable."""
+
+
+class StaleResultsError(ResultsError):
+    """The stored batch results are not the ones the caller loaded (``expected_created_at``).
+
+    Another process (e.g. ``uvcorr process``) replaced or removed
+    ``/results/current`` since the caller read it; writing overrides now
+    would attach them to results the caller has not seen.
+    """
 
 
 @dataclass(frozen=True)
@@ -755,7 +773,8 @@ class UVCache:
         options: FitOptions,
         *,
         keep_overrides: bool = True,
-    ) -> None:
+        drop_overrides: Callable[[ChannelKey, FitOptions], bool] | None = None,
+    ) -> int:
         """Store a batch run's results as ``/results/current``, replacing any previous ones.
 
         The new group is written completely before it replaces the old one
@@ -772,6 +791,16 @@ class UVCache:
             options: The options of the batch run.
             keep_overrides: Carry the existing overrides over to the new
                 results.
+            drop_overrides: With ``keep_overrides``: ``drop_overrides(key,
+                override_options)`` is called for each stored override, and
+                the overrides it returns True for are not carried over (e.g.
+                those fitted with the new batch options, which the new batch
+                rows reproduce). Decided on the overrides as stored, in the
+                same write.
+
+        Returns:
+            The number of stored overrides not carried over (every one with
+            ``keep_overrides=False``).
 
         Raises:
             ValueError: If a result is not a batch result or two results
@@ -801,8 +830,24 @@ class UVCache:
                 attrs["n_channels"] = np.int64(len(rows))
                 new.create_dataset(_TABLE, data=table)
                 current = group.get(_RESULTS_CURRENT)
-                if keep_overrides and current is not None and _OVERRIDES in current:
-                    _copy_overrides(current[_OVERRIDES], new)
+                n_dropped = 0
+                if current is not None and _OVERRIDES in current:
+                    if not keep_overrides:
+                        n_dropped = _override_count(current)
+                    elif drop_overrides is None:
+                        _copy_overrides(current[_OVERRIDES], new)
+                    else:
+                        entries = _read_override_entries(current)
+                        kept = {
+                            key: entry
+                            for key, entry in entries.items()
+                            if not drop_overrides(key, entry[1])
+                        }
+                        n_dropped = len(entries) - len(kept)
+                        if n_dropped:
+                            _write_override_entries(new, kept)
+                        else:  # nothing dropped: copy the table as it is
+                            _copy_overrides(current[_OVERRIDES], new)
                 if current is not None:
                     group.move(_RESULTS_CURRENT, _RESULTS_OLD)
                 group.move(_RESULTS_NEW, _RESULTS_CURRENT)  # commit point
@@ -813,6 +858,25 @@ class UVCache:
             # ignore it, the next write removes it), so cleanup is best-effort.
             _delete_quietly(group, _RESULTS_OLD)
         logger.info(f"Saved {len(rows)} channel results to {self._path}")
+        if n_dropped:
+            logger.info(f"{n_dropped} override(s) were not carried over")
+        return n_dropped
+
+    def results_created_at(self) -> str | None:
+        """``created_at`` of the stored batch results (a cheap attribute read), or None.
+
+        None when the file or its results do not exist. Compare it with
+        :attr:`StoredResults.created_at` to tell whether another process has
+        replaced the results since they were loaded.
+
+        Raises:
+            CacheBusyError: If another process holds the cache's lock.
+        """
+        if not self._path.is_file():
+            return None
+        with _open_h5(self._path) as h5f:
+            current = _current_results(h5f)
+            return None if current is None else _created_at(current)
 
     def load_results(self) -> StoredResults | None:
         """Load the stored results and overrides.
@@ -871,7 +935,8 @@ class UVCache:
     def save_override(self, result: ChannelResult, options: FitOptions) -> None:
         """Store (insert or replace) one channel's re-fit as an override.
 
-        The result is stored with ``options_source="override"``.
+        The result is stored with ``options_source="override"``. Same as
+        ``save_overrides([result], options)``.
 
         Args:
             result: The channel's re-fitted result.
@@ -882,14 +947,25 @@ class UVCache:
                 override to (run a batch first).
             CacheBusyError: If another process holds the cache's lock.
         """
-        if result.options_source != "override":
-            result = replace(result, options_source="override")
-        with _open_h5(self._path, "r+") as h5f:
-            current = self._current_for_overrides(h5f)
-            entries = _read_override_entries(current)
-            entries[result.key] = (result, options)
-            _write_override_entries(current, entries)
-        logger.info(f"Saved the override of {result.key} to {self._path}")
+        self.save_overrides([result], options)
+
+    def save_overrides(
+        self,
+        results: Iterable[ChannelResult],
+        options: OverrideOptions,
+        *,
+        expected_created_at: str | None = None,
+    ) -> int:
+        """Store (insert or replace) the re-fits of several channels as overrides, in one write.
+
+        See :meth:`replace_overrides` (with nothing to delete).
+
+        Returns:
+            The number of overrides stored (0 for no results; the file is
+            then not opened).
+        """
+        saved, _ = self.replace_overrides(results, options, expected_created_at=expected_created_at)
+        return saved
 
     def delete_override(self, key: ChannelKey | tuple[int, int, int, int]) -> bool:
         """Delete one channel's override.
@@ -903,40 +979,151 @@ class UVCache:
         Raises:
             CacheBusyError: If another process holds the cache's lock.
         """
-        if not self._path.is_file():
-            return False
-        wanted = tuple(int(k) for k in key)
+        return self.delete_overrides([key]) > 0
+
+    def delete_overrides(
+        self,
+        keys: Iterable[ChannelKey | tuple[int, int, int, int]],
+        *,
+        expected_created_at: str | None = None,
+    ) -> int:
+        """Delete the overrides of several channels, in one write.
+
+        See :meth:`replace_overrides` (with nothing to save).
+
+        Returns:
+            The number of overrides deleted.
+        """
+        _, deleted = self.replace_overrides(delete=keys, expected_created_at=expected_created_at)
+        return deleted
+
+    def replace_overrides(
+        self,
+        save: Iterable[ChannelResult] = (),
+        options: OverrideOptions | None = None,
+        delete: Iterable[ChannelKey | tuple[int, int, int, int]] = (),
+        *,
+        expected_created_at: str | None = None,
+    ) -> tuple[int, int]:
+        """Store some overrides and delete others, in one write.
+
+        The overrides table is replaced once, with the write-then-swap of
+        the module docstring, so either every change is made or, after an
+        exception, none (a board re-fit is one swap, not one per channel).
+        Saved results are stored with ``options_source="override"`` and
+        replace any override of their channel. Keys in ``delete`` without an
+        override are ignored. Nothing is written when there is nothing to
+        change; with nothing to save or delete the file is not opened.
+
+        Args:
+            save: The re-fitted results to store, one per channel.
+            options: The options they were fitted with: one
+                :class:`~uvcorr.options.FitOptions` for all, or a mapping
+                from channel key to options with an entry for every result.
+                Required when ``save`` is not empty.
+            delete: The channels whose overrides are deleted.
+            expected_created_at: The ``created_at`` of the batch results the
+                caller loaded (:attr:`StoredResults.created_at`); if the
+                stored results differ (or are gone), nothing is written.
+
+        Returns:
+            ``(saved, deleted)``: the numbers of overrides stored and deleted.
+
+        Raises:
+            ValueError: If two saved results have the same channel key, or a
+                channel is both saved and deleted.
+            KeyError: If ``options`` is a mapping without an entry for a
+                saved result.
+            TypeError: If results are saved without ``options``.
+            ResultsError: If results are saved but the cache has no batch
+                results to attach them to (run a batch first).
+            StaleResultsError: If ``expected_created_at`` does not match the
+                stored results.
+            CacheBusyError: If another process holds the cache's lock.
+            OSError: If results are saved and the file cannot be opened for
+                writing.
+        """
+        rows = sorted(
+            (
+                (
+                    result
+                    if result.options_source == "override"
+                    else replace(result, options_source="override")
+                )
+                for result in save
+            ),
+            key=lambda result: result.key,
+        )
+        _check_unique_keys(rows)
+        per_row = _options_per_row(rows, options)
+        wanted = {tuple(int(k) for k in key) for key in delete}
+        both = sorted(tuple(row.key) for row in rows if tuple(row.key) in wanted)
+        if both:
+            raise ValueError(f"Channel(s) both saved and deleted: {both}")
+        if not rows and not wanted:
+            return 0, 0
+        if not rows and not self._path.is_file():
+            self._check_created_at(None, expected_created_at)
+            return 0, 0
         with _open_h5(self._path, "r+") as h5f:
             current = _writable_current(h5f)
+            self._check_created_at(current, expected_created_at)
             if current is None:
-                return False
+                if rows:
+                    self._current_for_overrides(h5f)  # raises ResultsError
+                return 0, 0
             entries = _read_override_entries(current)
-            matches = [k for k in entries if tuple(k) == wanted]
-            if not matches:
-                return False
-            del entries[matches[0]]
+            doomed = [key for key in entries if tuple(key) in wanted]
+            if not rows and not doomed:
+                return 0, 0
+            for key in doomed:
+                del entries[key]
+            for row, opts in zip(rows, per_row):
+                entries[row.key] = (row, opts)
             _write_override_entries(current, entries)
-        return True
+        if len(rows) == 1 and not doomed:
+            logger.info(f"Saved the override of {rows[0].key} to {self._path}")
+        else:
+            logger.info(f"Saved {len(rows)} and deleted {len(doomed)} override(s) in {self._path}")
+        return len(rows), len(doomed)
 
-    def clear_overrides(self) -> int:
+    def clear_overrides(self, *, expected_created_at: str | None = None) -> int:
         """Delete every override.
+
+        Args:
+            expected_created_at: As in :meth:`replace_overrides`.
 
         Returns:
             The number of overrides deleted.
 
         Raises:
+            StaleResultsError: If ``expected_created_at`` does not match.
             CacheBusyError: If another process holds the cache's lock.
         """
         if not self._path.is_file():
+            self._check_created_at(None, expected_created_at)
             return 0
         with _open_h5(self._path, "r+") as h5f:
             current = _writable_current(h5f)
+            self._check_created_at(current, expected_created_at)
             if current is None:
                 return 0
-            n = len(_read_override_entries(current))
+            n = _override_count(current)
             if _OVERRIDES in current:
                 del current[_OVERRIDES]
         return n
+
+    def _check_created_at(self, current: Any, expected: str | None) -> None:
+        """Raise :class:`StaleResultsError` unless the stored results are the expected ones."""
+        if expected is None:
+            return
+        found = None if current is None else _created_at(current)
+        if found != expected:
+            what = "were removed" if found is None else f"were replaced (saved {found})"
+            raise StaleResultsError(
+                f"The stored results in {self._path.name} {what} since they were loaded "
+                f"(saved {expected}), probably by another process"
+            )
 
     def _current_for_overrides(self, h5f: Any) -> Any:
         current = _writable_current(h5f)
@@ -1294,6 +1481,40 @@ _OPTIONS_COLUMN = "options_json"
 _MISSING_COUNT = -1  # a count column's None in the HDF5 table
 
 _OverrideEntries = dict["ChannelKey", tuple["ChannelResult", FitOptions]]
+
+OverrideOptions = FitOptions | Mapping["ChannelKey | tuple[int, int, int, int]", FitOptions]
+"""The options of saved overrides: one set for all, or one per channel key."""
+
+
+def _options_per_row(
+    rows: list[ChannelResult], options: OverrideOptions | None
+) -> list[FitOptions]:
+    """The options of each saved override (see :meth:`UVCache.replace_overrides`)."""
+    if not rows:
+        return []
+    if options is None:
+        raise TypeError("Saving overrides needs their fit options")
+    if isinstance(options, FitOptions):
+        return [options] * len(rows)
+    by_key = {tuple(int(k) for k in key): opts for key, opts in options.items()}
+    per_row = []
+    for row in rows:
+        opts = by_key.get(tuple(row.key))
+        if opts is None:
+            raise KeyError(f"No fit options given for the override of {row.key}")
+        per_row.append(opts)
+    return per_row
+
+
+def _created_at(current: Any) -> str:
+    """The ``created_at`` attribute of a results group ("" if missing)."""
+    return _attr_text(current.attrs.get("created_at", ""))
+
+
+def _override_count(current: Any) -> int:
+    """Rows in the overrides table of a results group (read from the shape, not decoded)."""
+    table = _override_table(current)
+    return 0 if table is None else int(table.shape[0])
 
 
 def _check_unique_keys(rows: list[ChannelResult]) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,11 +22,10 @@ from tests.gui.ring_cache import (
     OUTLIERS,
     RING_BOARDS,
     TOO_FEW,
-    copy_files,
     store_batch_results,
 )
 from uvcorr import cache as cache_module
-from uvcorr.analysis import OPTIONS_BATCH, OPTIONS_OVERRIDE, ChannelKey
+from uvcorr.analysis import OPTIONS_BATCH, OPTIONS_OVERRIDE, AnalysisCancelled, ChannelKey
 from uvcorr.cache import CacheBusyError, ResultsError, UVCache, UVCacheError
 from uvcorr.ellipse import EllipseParams
 from uvcorr.gui._system_map_model import ChannelView
@@ -37,11 +37,17 @@ from uvcorr.gui.session import (
     UVSession,
     channel_title,
     channel_view,
+    describe_options_change,
+    effective_options,
     inspect_raw,
     is_cache_file,
     load_cache,
     load_raw,
+    same_fit,
+    short_title,
 )
+from uvcorr.io.summary_csv import read_summary_csv
+from uvcorr.io.tec import read_tec
 from uvcorr.options import (
     FLAG_EXTREME_AXIS_RATIO,
     FLAG_HIGH_REJECTION,
@@ -51,23 +57,7 @@ from uvcorr.options import (
     FitOptions,
 )
 
-
-@pytest.fixture(scope="module")
-def _results_master(
-    tmp_path_factory: pytest.TempPathFactory, _ring_files_master: RingFiles
-) -> RingFiles:
-    dat, cache = copy_files(
-        _ring_files_master.dat, _ring_files_master.cache, tmp_path_factory.mktemp("results")
-    )
-    store_batch_results(cache)
-    return RingFiles(dat, cache)
-
-
-@pytest.fixture
-def results_files(tmp_path: Path, _results_master: RingFiles) -> RingFiles:
-    """A private copy of the ring ``.dat`` and its cache with stored batch results."""
-    dat, cache = copy_files(_results_master.dat, _results_master.cache, tmp_path / "res")
-    return RingFiles(dat, cache)
+# ``results_files`` (the ring files with stored batch results) comes from conftest.py
 
 
 @pytest.fixture
@@ -458,3 +448,467 @@ def test_cache_busy_is_reported(
     monkeypatch.setattr(cache_module, "LOCK_RETRY_SECONDS", 0.1)
     with hold_h5_open(results_files.cache), pytest.raises(CacheBusyError, match="in use"):
         session.channel_detail(CLEAN)
+
+
+# ---------------------------------------------------------------------------
+# Re-fits, reverts and exports (phase 5)
+# ---------------------------------------------------------------------------
+
+ROBUST_OFF = FitOptions(robust=False)
+
+
+def test_describe_options_change() -> None:
+    batch = FitOptions()
+    assert describe_options_change(batch, batch) == ""
+    assert describe_options_change(ROBUST_OFF, batch) == "robust off"
+    changed = FitOptions(clip_k=3.0, max_iter=8, geometric=True, min_events=1500)
+    assert describe_options_change(changed, batch) == (
+        "clip k 3, max iter 8, geometric on, min events 1,500"
+    )
+    assert describe_options_change(FitOptions(phase_ref_freq_hz=5e5), batch) == (
+        "ref freq 500000 Hz"
+    )
+    assert short_title(ChannelKey(2, 16, 0, 27)) == "N2 B16 R0 Ch27"
+
+
+def test_refit_channel_with_other_options_stores_an_override(
+    session: UVSession, results_files: RingFiles
+) -> None:
+    before = session.result(OUTLIERS)
+    assert before is not None and before.n_rejected
+    request = session.refit_request(ROBUST_OFF, channel=OUTLIERS)
+    assert request.as_override and request.title == "N1 B15 R0 Ch12" and not request.is_board
+    progress: list[tuple[int, int]] = []
+    outcome = session.run_refit(request, progress_cb=lambda d, t: progress.append((d, t)))
+    assert progress == [(0, 1), (1, 1)]
+    assert outcome.saved == (OUTLIERS,) and outcome.removed == () and outcome.changed == (OUTLIERS,)
+    assert outcome.results[0].options_source == OPTIONS_OVERRIDE
+    assert outcome.describe().startswith("Override saved for N1 B15 R0 Ch12 (robust off); ")
+    assert session.result(OUTLIERS) == before  # nothing changes before apply_refit
+    assert session.apply_refit(outcome) == (OUTLIERS,)
+    result = session.result(OUTLIERS)
+    assert result is not None and result.options_source == OPTIONS_OVERRIDE
+    assert result.n_rejected == 0
+    assert session.override_keys() == [OUTLIERS] == session.override_keys(1, 15)
+    assert session.override_keys(1, 16) == []
+    assert session.override_options(OUTLIERS) == ROBUST_OFF
+    assert session.override_change(OUTLIERS) == "robust off"
+    assert session.override_change(CLEAN) is None
+    view = session.view(OUTLIERS)
+    assert view is not None and view.is_override
+    stored = UVCache(results_files.cache).load_results()
+    assert stored is not None and stored.overrides[OUTLIERS].options == ROBUST_OFF
+    assert "1 override" in session.describe()
+
+
+def test_refit_with_the_batch_options_reverts(session: UVSession) -> None:
+    session.apply_refit(session.run_refit(session.refit_request(ROBUST_OFF, channel=OUTLIERS)))
+    batch = session.batch_options
+    assert batch is not None
+    outcome = session.run_refit(session.refit_request(batch, channel=OUTLIERS))
+    assert not outcome.request.as_override
+    assert outcome.saved == () and outcome.removed == (OUTLIERS,)
+    assert outcome.describe().startswith("N1 B15 R0 Ch12 reverted to batch (override removed)")
+    assert session.apply_refit(outcome) == (OUTLIERS,)
+    result = session.result(OUTLIERS)
+    assert result is not None and result.options_source == OPTIONS_BATCH
+    assert session.override_keys() == []
+    cached = session.cache
+    assert cached is not None
+    stored = cached.load_results()
+    assert stored is not None and stored.overrides == {}
+    # Again: no override to remove, nothing stored
+    again = session.run_refit(session.refit_request(batch, channel=OUTLIERS))
+    assert again.changed == () and "it matches the batch, nothing stored" in again.describe()
+
+
+def test_refit_board_stores_every_channel_in_one_write(
+    session: UVSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = session.cache
+    assert cache is not None
+    writes: list[int] = []
+    real_replace = UVCache.replace_overrides
+
+    def counting(self: UVCache, save=(), options=None, delete=(), **kwargs):  # type: ignore[no-untyped-def]
+        save = list(save)
+        writes.append(len(save))
+        return real_replace(self, save, options, delete, **kwargs)
+
+    monkeypatch.setattr(UVCache, "replace_overrides", counting)
+    options = FitOptions(clip_k=3.0)
+    request = session.refit_request(options, board=(1, 16))
+    assert request.is_board and request.title == "N1 B16"
+    progress: list[tuple[int, int]] = []
+    outcome = session.run_refit(request, progress_cb=lambda d, t: progress.append((d, t)))
+    assert writes == [CHANNELS_PER_BOARD]
+    assert progress[0] == (0, CHANNELS_PER_BOARD) and progress[-1] == (6, 6)
+    assert outcome.saved == tuple(session.channels_on_board(1, 16))
+    assert outcome.describe().startswith("Overrides saved for the 6 channels of N1 B16 (clip k 3)")
+    session.apply_refit(outcome)
+    assert session.override_keys(1, 16) == session.channels_on_board(1, 16)
+    # A board re-fit with the batch options reverts the whole board
+    batch = session.batch_options
+    assert batch is not None
+    revert = session.run_refit(session.refit_request(batch, board=(1, 16)))
+    assert revert.removed == outcome.saved and revert.saved == ()
+    assert revert.describe().startswith("N1 B16 reverted to batch (6 overrides removed)")
+    session.apply_refit(revert)
+    assert session.override_keys() == []
+
+
+def test_refit_stop_stores_nothing(session: UVSession) -> None:
+    stop = threading.Event()
+
+    def progress(done: int, _total: int) -> None:
+        if done == 2:
+            stop.set()
+
+    request = session.refit_request(ROBUST_OFF, board=(1, 15))
+    with pytest.raises(AnalysisCancelled):
+        session.run_refit(request, progress_cb=progress, stop_flag=stop)
+    assert not session.batch_running
+    cache = session.cache
+    assert cache is not None
+    stored = cache.load_results()
+    assert stored is not None and stored.overrides == {}
+
+
+def test_refit_request_errors(session: UVSession, ring_files: RingFiles) -> None:
+    with pytest.raises(ValueError, match="channel or a board"):
+        session.refit_request(ROBUST_OFF)
+    with pytest.raises(ValueError, match="channel or a board"):
+        session.refit_request(ROBUST_OFF, channel=CLEAN, board=(1, 15))
+    with pytest.raises(SessionError, match="no events"):
+        session.refit_request(ROBUST_OFF, channel=ChannelKey(1, 15, 0, 4))
+    with pytest.raises(SessionError, match="no events"):
+        session.refit_request(ROBUST_OFF, board=(2, 20))
+    request = session.refit_request(ROBUST_OFF, channel=CLEAN)
+    session._batch_lock.acquire()
+    try:
+        with pytest.raises(SessionBusyError):
+            session.refit_request(ROBUST_OFF, channel=CLEAN)
+        with pytest.raises(SessionBusyError):
+            session.run_refit(request)
+        with pytest.raises(SessionBusyError):
+            session.revert_overrides([CLEAN])
+        with pytest.raises(SessionBusyError):
+            session.clear_overrides()
+    finally:
+        session._batch_lock.release()
+    unfitted = UVSession()
+    with pytest.raises(SessionError, match="No file"):
+        unfitted.refit_request(ROBUST_OFF, channel=CLEAN)
+    unfitted.install(load_cache(ring_files.cache))
+    with pytest.raises(ResultsError, match="run Fit All first"):
+        unfitted.refit_request(ROBUST_OFF, channel=CLEAN)
+
+
+def test_apply_refit_refuses_a_stale_outcome(session: UVSession) -> None:
+    session.apply_refit(session.run_refit(session.refit_request(ROBUST_OFF, channel=OUTLIERS)))
+    outcome = session.run_refit(session.refit_request(ROBUST_OFF, channel=CLEAN))
+    session.revert_overrides([OUTLIERS])  # the stored results changed since the request
+    with pytest.raises(SessionError, match="changed while the re-fit ran"):
+        session.apply_refit(outcome)
+
+
+def test_a_refit_and_a_batch_exclude_each_other(session: UVSession) -> None:
+    request = session.refit_request(ROBUST_OFF, channel=CLEAN)
+    with session._exclusive("A re-fit"), pytest.raises(SessionBusyError, match="A re-fit is"):
+        session.run_batch(FitOptions(), workers=1)
+    with session._exclusive("Fit All"), pytest.raises(SessionBusyError, match="Fit All is"):
+        session.run_refit(request)
+
+
+def test_revert_board_and_clear(session: UVSession) -> None:
+    session.apply_refit(session.run_refit(session.refit_request(ROBUST_OFF, board=(1, 15))))
+    session.apply_refit(
+        session.run_refit(session.refit_request(ROBUST_OFF, channel=CLEAN._replace(board=16)))
+    )
+    assert len(session.override_keys()) == 7
+    assert session.revert_overrides([CLEAN, ChannelKey(1, 15, 0, 4)]) == (CLEAN,)
+    assert session.revert_overrides([CLEAN]) == ()
+    assert session.revert_board(1, 15) == tuple(
+        k for k in session.channels_on_board(1, 15) if k != CLEAN
+    )
+    assert session.override_keys() == [CLEAN._replace(board=16)]
+    assert session.clear_overrides() == (CLEAN._replace(board=16),)
+    assert session.clear_overrides() == ()
+    cache = session.cache
+    assert cache is not None
+    stored = cache.load_results()
+    assert stored is not None and stored.overrides == {}
+    assert all(r.options_source == OPTIONS_BATCH for r in session.merged_results())
+
+
+def test_run_batch_can_discard_the_overrides(session: UVSession) -> None:
+    session.apply_refit(session.run_refit(session.refit_request(ROBUST_OFF, channel=CLEAN)))
+    kept = session.run_batch(FitOptions(), workers=1)
+    assert kept.keep_overrides and CLEAN in kept.stored.overrides
+    session.apply_batch(kept)
+    discarded = session.run_batch(FitOptions(), keep_overrides=False, workers=1)
+    assert not discarded.keep_overrides and discarded.stored.overrides == {}
+    session.apply_batch(discarded)
+    assert session.override_keys() == []
+
+
+def test_exports_write_the_merged_results(session: UVSession, tmp_path: Path) -> None:
+    assert session.export_stem == "rings"
+    session.apply_refit(session.run_refit(session.refit_request(ROBUST_OFF, channel=OUTLIERS)))
+    summary = session.export_outputs(tmp_path / "out")
+    tec, csv = tmp_path / "out" / "rings.tec", tmp_path / "out" / "radial_summary.csv"
+    assert summary.paths == (tec, csv)
+    rows = read_summary_csv(csv)
+    assert summary.n_rows == len(rows) == 18
+    assert summary.n_overrides == 1
+    by_key = {row.key: row for row in rows}
+    assert by_key[OUTLIERS].options_source == OPTIONS_OVERRIDE
+    assert by_key[OUTLIERS].n_rejected == 0
+    entries = read_tec(tec)
+    assert summary.n_ok == len(entries) == sum(1 for row in rows if row.status == STATUS_OK)
+    assert entries[OUTLIERS].params.a == pytest.approx(by_key[OUTLIERS].semiMajor, rel=1e-5)
+    single = session.export_tec(tmp_path / "single.tec")
+    assert single.paths == (tmp_path / "single.tec",) and read_tec(single.paths[0]) == entries
+    assert session.export_csv(tmp_path / "s.csv").n_rows == 18
+
+
+def test_exports_need_results(ring_files: RingFiles, tmp_path: Path) -> None:
+    session = UVSession()
+    with pytest.raises(SessionError, match="No file"):
+        session.export_tec(tmp_path / "x.tec")
+    session.install(load_cache(ring_files.cache))
+    with pytest.raises(SessionError, match="run Fit All first"):
+        session.export_outputs(tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: effective options, stale results, export guard, single writes
+# ---------------------------------------------------------------------------
+
+
+def test_effective_options_ignore_clip_settings_without_robust() -> None:
+    plain = FitOptions(robust=False)
+    assert effective_options(plain) == plain
+    odd = FitOptions(robust=False, clip_k=3.0, max_iter=9)
+    assert effective_options(odd) == plain and same_fit(odd, plain)
+    robust = FitOptions(clip_k=3.0)
+    assert effective_options(robust) is robust and not same_fit(robust, FitOptions())
+    assert not same_fit(odd, FitOptions(robust=False, min_events=50))
+    # Descriptions compare effective options on both sides
+    assert describe_options_change(odd, plain) == ""
+    assert describe_options_change(plain, FitOptions(clip_k=3.0)) == "robust off"
+    assert describe_options_change(FitOptions(clip_k=3.0), odd) == "robust on, clip k 3"
+
+
+def test_robust_off_batch_ignores_the_clip_settings(ring_files: RingFiles) -> None:
+    """A batch fitted without the robust iteration: clip k decides nothing (review s9)."""
+    store_batch_results(ring_files.cache, FitOptions(robust=False))
+    session = UVSession()
+    session.install(load_cache(ring_files.cache))
+    request = session.refit_request(FitOptions(clip_k=3.0), channel=OUTLIERS)
+    assert request.as_override
+    session.apply_refit(session.run_refit(request))
+    assert session.override_change(OUTLIERS) == "robust on, clip k 3"
+    # Robust off again, with the clip spin still showing 3: the batch fit, so it reverts
+    request = session.refit_request(FitOptions(robust=False, clip_k=3.0), channel=OUTLIERS)
+    assert not request.as_override and request.n_reverted == 1
+    assert request.describe_start() == (
+        "Fit Channel N1 B15 R0 Ch12 with the batch options (reverts its override)…"
+    )
+    outcome = session.run_refit(request)
+    assert outcome.removed == (OUTLIERS,) and outcome.saved == ()
+    session.apply_refit(outcome)
+    assert session.override_keys() == []
+
+
+def test_fit_all_drops_overrides_fitted_with_the_new_options(session: UVSession) -> None:
+    session.apply_refit(
+        session.run_refit(session.refit_request(FitOptions(robust=False), channel=OUTLIERS))
+    )
+    session.apply_refit(
+        session.run_refit(session.refit_request(FitOptions(clip_k=3.0), channel=CLEAN))
+    )
+    new_batch = FitOptions(robust=False, clip_k=2.0)  # fits like the OUTLIERS override
+    assert session.overrides_fitting_like(new_batch) == [OUTLIERS]
+    outcome = session.run_batch(new_batch, workers=1)
+    assert outcome.keep_overrides and outcome.n_dropped == 1
+    assert list(outcome.stored.overrides) == [CLEAN]
+    session.apply_batch(outcome)
+    assert session.override_keys() == [CLEAN]
+    discard = session.run_batch(new_batch, keep_overrides=False, workers=1)
+    assert discard.n_dropped == 1 and discard.stored.overrides == {}
+
+
+def _replace_batch_on_disk(results_files: RingFiles) -> None:
+    """What ``uvcorr process`` in another terminal does: store a new batch (overrides kept)."""
+    store_batch_results(results_files.cache, FitOptions(clip_k=3.0))
+
+
+def test_refit_refuses_results_replaced_on_disk(
+    session: UVSession, results_files: RingFiles
+) -> None:
+    session.apply_refit(
+        session.run_refit(session.refit_request(FitOptions(robust=False), channel=CLEAN))
+    )
+    request = session.refit_request(FitOptions(robust=False), channel=OUTLIERS)
+    _replace_batch_on_disk(results_files)
+    on_disk = UVCache(results_files.cache).load_results()
+    assert on_disk is not None and list(on_disk.overrides) == [CLEAN]
+    assert session.results_changed_on_disk()
+    with pytest.raises(SessionError, match=r"stored results changed on disk \(another process"):
+        session.run_refit(request)
+    with pytest.raises(SessionError, match="reopen the file"):
+        session.revert_overrides([CLEAN])
+    with pytest.raises(SessionError, match="changed on disk"):
+        session.clear_overrides()
+    after = UVCache(results_files.cache).load_results()
+    assert after == on_disk  # nothing was written into the new results
+    assert not session.batch_running
+    # Reopening picks up the new batch; writes work again
+    session.install(load_cache(results_files.cache))
+    assert not session.results_changed_on_disk()
+    assert session.revert_overrides([CLEAN]) == (CLEAN,)
+
+
+def test_export_warns_about_results_replaced_on_disk(
+    session: UVSession, results_files: RingFiles, tmp_path: Path
+) -> None:
+    assert session.export_csv(tmp_path / "a.csv").warning == ""
+    _replace_batch_on_disk(results_files)
+    summary = session.export_csv(tmp_path / "b.csv")
+    assert "changed on disk" in summary.warning and summary.paths == (tmp_path / "b.csv",)
+
+
+def test_refit_revert_with_a_save_is_one_write(
+    session: UVSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch-options board re-fit that also stores a channel without a batch row."""
+    session.apply_refit(
+        session.run_refit(session.refit_request(FitOptions(robust=False), board=(1, 15)))
+    )
+    batch = session.batch_options
+    assert batch is not None
+    request = session.refit_request(batch, board=(1, 15))
+    stored = request.stored
+    # A batch row that a newer uvcorr could leave unreadable: CLEAN has none
+    request = replace(
+        request, stored=replace(stored, results=tuple(r for r in stored.results if r.key != CLEAN))
+    )
+    calls: list[tuple[int, int]] = []
+    real_replace = UVCache.replace_overrides
+
+    def counting(self: UVCache, save=(), options=None, delete=(), **kwargs):  # type: ignore[no-untyped-def]
+        save, delete = list(save), list(delete)
+        calls.append((len(save), len(delete)))
+        return real_replace(self, save, options, delete, **kwargs)
+
+    monkeypatch.setattr(UVCache, "replace_overrides", counting)
+    outcome = session.run_refit(request)
+    assert calls == [(1, 5)]
+    assert outcome.saved == (CLEAN,) and len(outcome.removed) == 5
+    # A failure of that one write changes nothing
+    monkeypatch.setattr(cache_module, "_write_override_entries", _raise_os_error)
+    before = UVCache(request.cache.path).load_results()
+    with pytest.raises(OSError, match="simulated"):
+        session.run_refit(request)
+    assert UVCache(request.cache.path).load_results() == before
+
+
+def _raise_os_error(*_args: object) -> None:
+    raise OSError("simulated HDF5 error")
+
+
+def test_revert_requests(session: UVSession) -> None:
+    assert session.revert_request([CLEAN]) is None  # no override
+    session.apply_refit(
+        session.run_refit(session.refit_request(FitOptions(robust=False), board=(1, 15)))
+    )
+    channel = session.revert_request([CLEAN])
+    assert channel is not None and channel.keys == (CLEAN,) and not channel.is_all
+    board = session.revert_request(board=(1, 15))
+    assert board is not None and len(board.keys) == 6 and board.title == "N1 B15"
+    everything = session.revert_request()
+    assert everything is not None and everything.is_all
+    outcome = session.run_revert(channel)
+    assert outcome.describe() == "N1 B15 R0 Ch05 reverted to batch (override removed)"
+    assert session.override_keys(1, 15) != []  # not applied yet
+    assert session.apply_revert(outcome) == (CLEAN,)
+    with pytest.raises(SessionError, match="changed while the revert ran"):
+        session.apply_revert(session.run_revert(board))  # the request predates the revert
+    board = session.revert_request(board=(1, 15))
+    assert board is not None
+    assert session.run_revert(board).describe() == "N1 B15 reverted to batch (5 overrides removed)"
+
+
+def test_export_refuses_to_overwrite_data(results_files: RingFiles, tmp_path: Path) -> None:
+    """Review s10: an export must never replace the raw file, the cache or another cache."""
+    dat, cache = results_files.dat, results_files.cache
+    session = UVSession()
+    session.install(load_raw(dat))  # reuses the valid cache next to the private .dat copy
+    assert session.dat_path == dat and session.cache_path == cache
+    sizes = {path: path.stat().st_size for path in (dat, cache)}
+    link = tmp_path / "link.uv.h5"
+    link.symlink_to(cache)
+    hard = tmp_path / "hard.bin"
+    os.link(dat, hard)
+    other_cache = tmp_path / "other.h5"
+    with h5py.File(other_cache, "w") as h5f:
+        h5f["x"] = [1]
+    other_dat = tmp_path / "old_run.dat"
+    other_dat.write_bytes(b"raw bytes")
+    cases = [
+        (session.export_tec, dat, "open raw data file"),
+        (session.export_csv, cache, "open UV cache"),
+        (session.export_tec, link, "open UV cache"),
+        (session.export_csv, hard, "open raw data file"),
+        (session.export_csv, other_cache, "HDF5 file"),
+        (session.export_tec, other_dat, "raw .dat file"),
+    ]
+    for export, target, reason in cases:
+        with pytest.raises(SessionError, match=reason):
+            export(target)
+    # Export both: either output path is checked
+    folder = tmp_path / "out"
+    folder.mkdir()
+    csv_as_cache = folder / "radial_summary.csv"
+    csv_as_cache.write_bytes(other_cache.read_bytes())
+    with pytest.raises(SessionError, match="HDF5 file"):
+        session.export_outputs(folder)
+    assert not (folder / "rings.tec").exists()  # nothing was written
+    with pytest.raises(SessionError, match="open raw data file"):
+        _export_onto_dat(session, dat)
+    assert {path: path.stat().st_size for path in (dat, cache)} == sizes
+    assert h5py.is_hdf5(cache) and other_dat.read_bytes() == b"raw bytes"
+    # A new file with a .dat suffix, or a plain existing text file, is fine
+    assert session.export_csv(tmp_path / "new.dat").n_rows == 18
+    (tmp_path / "old.csv").write_text("old")
+    assert session.export_csv(tmp_path / "old.csv").n_rows == 18
+
+
+def _export_onto_dat(session: UVSession, dat: Path) -> None:
+    """Export Both into a folder whose ``<stem>.tec`` is the open raw file (renamed .tec)."""
+    target = dat.parent / "tecdir"
+    target.mkdir()
+    (target / f"{session.export_stem}.tec").symlink_to(dat)
+    session.export_outputs(target)
+
+
+def test_export_errors_name_the_target(session: UVSession, tmp_path: Path) -> None:
+    target = tmp_path / "missing" / "x.tec"
+    with pytest.raises(OSError) as info:
+        session.export_tec(target)
+    message = str(info.value)
+    assert message.startswith(f"Cannot write {target}: ") and ".tmp" not in message
+    folder = tmp_path / "ro"
+    folder.mkdir()
+    folder.chmod(0o500)
+    try:
+        if os.access(folder, os.W_OK):  # root ignores permissions
+            pytest.skip("the directory is writable anyway")
+        with pytest.raises(OSError) as info:
+            session.export_outputs(folder)
+        message = str(info.value)
+        assert message == f"Cannot write to the directory {folder}: Permission denied"
+    finally:
+        folder.chmod(0o700)

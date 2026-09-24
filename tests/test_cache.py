@@ -36,6 +36,7 @@ from uvcorr.cache import (
     CacheBusyError,
     InsufficientDiskSpaceError,
     ResultsError,
+    StaleResultsError,
     UVCache,
     compute_source_hash,
     default_cache_path,
@@ -1418,3 +1419,266 @@ class TestResults:
         built.save_override(BATCH[1], REFIT)
         stored = built.load_results()
         assert pickle.loads(pickle.dumps(stored)) == stored
+
+
+class TestBulkOverrides:
+    """``save_overrides`` / ``delete_overrides``: several channels in one table swap."""
+
+    @staticmethod
+    def _count_table_writes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record every overrides table written (``table_new``, the swap's first step)."""
+        writes: list[str] = []
+        real_create = h5py.Group.create_dataset
+
+        def counting_create(self: Any, name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "table_new":
+                writes.append(self.name)
+            return real_create(self, name, *args, **kwargs)
+
+        monkeypatch.setattr(h5py.Group, "create_dataset", counting_create)
+        return writes
+
+    def test_save_and_delete_in_one_swap_each(
+        self, built: UVCache, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_override(dataclasses.replace(BATCH[0], post_sigma=1.5), REFIT)
+        writes = self._count_table_writes(monkeypatch)
+        refits = [dataclasses.replace(r, post_sigma=4.0 + i) for i, r in enumerate(BATCH[:3])]
+        assert built.save_overrides(refits, REFIT) == 3
+        assert writes == ["/results/current/overrides"]  # one swap for three channels
+        stored = built.load_results()
+        assert stored is not None
+        assert list(stored.overrides) == sorted(r.key for r in refits)  # BATCH[0] replaced
+        for refit in refits:
+            override = stored.overrides[refit.key]
+            assert override.options == REFIT and override.result.options_source == "override"
+            assert override.result.post_sigma == refit.post_sigma
+        merged = {r.key: r.options_source for r in stored.merged()}
+        assert merged[BATCH[3].key] == "batch"
+
+        writes.clear()
+        missing = (9, 30, 1, 28)
+        assert built.delete_overrides([BATCH[0].key, ChannelKey(*BATCH[1].key), missing]) == 2
+        assert writes == ["/results/current/overrides"]  # the smaller table, written once
+        stored = built.load_results()
+        assert stored is not None and list(stored.overrides) == [BATCH[2].key]
+        assert built.delete_overrides([missing]) == 0 and built.delete_overrides([]) == 0
+        assert built.delete_overrides([BATCH[2].key]) == 1  # the last one: the group goes
+        stored = built.load_results()
+        assert stored is not None and stored.overrides == {}
+        with h5py.File(built.path, "r") as h5f:
+            assert "overrides" not in h5f["results/current"]
+
+    def test_per_channel_options(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        options = {BATCH[0].key: REFIT, tuple(BATCH[1].key): FitOptions(clip_k=2.5)}
+        assert built.save_overrides(BATCH[:2], options) == 2
+        stored = built.load_results()
+        assert stored is not None
+        assert stored.overrides[BATCH[0].key].options == REFIT
+        assert stored.overrides[BATCH[1].key].options == FitOptions(clip_k=2.5)
+        with pytest.raises(KeyError, match="No fit options"):
+            built.save_overrides(BATCH[:3], options)
+
+    def test_validation_and_empty_input(self, built: UVCache) -> None:
+        assert built.save_overrides([], REFIT) == 0  # no batch results needed for nothing
+        with pytest.raises(ResultsError, match="run a batch"):
+            built.save_overrides(BATCH[:2], REFIT)
+        built.save_results(BATCH, FitOptions())
+        with pytest.raises(ValueError, match="Duplicate"):
+            built.save_overrides([BATCH[0], BATCH[0]], REFIT)
+        stored = built.load_results()
+        assert stored is not None and stored.overrides == {}
+        assert UVCache(built.path.with_name("missing.uv.h5")).delete_overrides([BATCH[0].key]) == 0
+
+    @pytest.mark.parametrize("operation", ["save", "delete"])
+    def test_failure_midway_changes_nothing(
+        self, built: UVCache, monkeypatch: pytest.MonkeyPatch, operation: str
+    ) -> None:
+        """An error inside the table swap leaves every previous override in place."""
+        built.save_results(BATCH, FitOptions())
+        built.save_overrides(
+            [dataclasses.replace(r, post_sigma=4.5) for r in BATCH[:2]], FitOptions(clip_k=3.0)
+        )
+        before = built.load_results()
+        assert before is not None and len(before.overrides) == 2
+        real_create = h5py.Group.create_dataset
+        real_delitem = h5py.Group.__delitem__
+
+        def failing_create(self: Any, name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "table_new":
+                real_create(self, name, *args, **kwargs)  # written, then the disk fails
+                raise OSError("simulated HDF5 error")
+            return real_create(self, name, *args, **kwargs)
+
+        def failing_delitem(self: Any, name: str) -> None:
+            if name == "table":  # the commit point of the swap
+                raise OSError("simulated HDF5 error")
+            real_delitem(self, name)
+
+        if operation == "save":
+            monkeypatch.setattr(h5py.Group, "create_dataset", failing_create)
+            with pytest.raises(OSError, match="simulated"):
+                built.save_overrides([dataclasses.replace(r, post_sigma=9.0) for r in BATCH], REFIT)
+        else:
+            monkeypatch.setattr(h5py.Group, "__delitem__", failing_delitem)
+            with pytest.raises(OSError, match="simulated"):
+                built.delete_overrides([BATCH[0].key])
+        monkeypatch.undo()
+        assert built.load_results() == before  # all or nothing
+        with h5py.File(built.path, "r") as h5f:
+            assert set(h5f["results/current/overrides"]) == {"table"}
+        # The next write works normally
+        assert built.delete_overrides([r.key for r in BATCH]) == 2
+
+
+class TestReplaceOverrides:
+    """``replace_overrides``: saves and deletes in one swap; the stale-results check."""
+
+    def test_save_and_delete_in_one_swap(
+        self, built: UVCache, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_overrides(BATCH[:2], REFIT)
+        writes = TestBulkOverrides._count_table_writes(monkeypatch)
+        refit = dataclasses.replace(BATCH[2], n_events=2)
+        assert built.replace_overrides([refit], FitOptions(min_events=1), [BATCH[0].key]) == (1, 1)
+        assert writes == ["/results/current/overrides"]
+        stored = built.load_results()
+        assert stored is not None and list(stored.overrides) == sorted([BATCH[1].key, refit.key])
+        assert stored.overrides[refit.key].options == FitOptions(min_events=1)
+        writes.clear()
+        assert built.replace_overrides() == (0, 0) and writes == []  # nothing to do
+        assert built.replace_overrides(delete=[(9, 30, 1, 28)]) == (0, 0) and writes == []
+
+    def test_validation(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        with pytest.raises(ValueError, match="both saved and deleted"):
+            built.replace_overrides([BATCH[0]], REFIT, [BATCH[0].key])
+        with pytest.raises(TypeError, match="fit options"):
+            built.replace_overrides([BATCH[0]])
+        stored = built.load_results()
+        assert stored is not None and stored.overrides == {}
+
+    def test_failure_midway_changes_nothing(
+        self, built: UVCache, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_overrides(BATCH[:2], REFIT)
+        before = built.load_results()
+
+        def boom(*_args: Any) -> None:
+            raise OSError("simulated HDF5 error")
+
+        monkeypatch.setattr(cache, "_write_override_entries", boom)
+        with pytest.raises(OSError, match="simulated"):
+            built.replace_overrides([BATCH[2]], REFIT, [BATCH[0].key])
+        monkeypatch.undo()
+        assert built.load_results() == before  # the delete did not happen without the save
+
+    @pytest.mark.parametrize("operation", ["save", "delete", "replace", "clear"])
+    def test_stale_results_are_refused(self, built: UVCache, operation: str) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_overrides(BATCH[:1], REFIT)
+        loaded = built.load_results()
+        assert loaded is not None and built.results_created_at() == loaded.created_at
+        # Another process replaces the batch (keeping the overrides)
+        built.save_results(BATCH, FitOptions(clip_k=3.0))
+        assert built.results_created_at() != loaded.created_at
+        before = built.load_results()
+        expected = loaded.created_at
+        with pytest.raises(StaleResultsError, match="replaced"):
+            if operation == "save":
+                built.save_overrides(BATCH[1:2], REFIT, expected_created_at=expected)
+            elif operation == "delete":
+                built.delete_overrides([BATCH[0].key], expected_created_at=expected)
+            elif operation == "replace":
+                built.replace_overrides(
+                    BATCH[1:2], REFIT, [BATCH[0].key], expected_created_at=expected
+                )
+            else:
+                built.clear_overrides(expected_created_at=expected)
+        assert built.load_results() == before
+        # With the current created_at the write goes through
+        current = built.results_created_at()
+        assert built.clear_overrides(expected_created_at=current) == 1
+
+    def test_removed_results_are_stale_too(self, built: UVCache, tmp_path: Path) -> None:
+        built.save_results(BATCH, FitOptions())
+        stored = built.load_results()
+        assert stored is not None
+        with h5py.File(built.path, "r+") as h5f:
+            del h5f["results"]
+        assert built.results_created_at() is None
+        with pytest.raises(StaleResultsError, match="removed"):
+            built.save_overrides(BATCH[:1], REFIT, expected_created_at=stored.created_at)
+        with pytest.raises(StaleResultsError):
+            built.delete_overrides([BATCH[0].key], expected_created_at=stored.created_at)
+        missing = UVCache(tmp_path / "gone.uv.h5")
+        assert missing.results_created_at() is None
+        with pytest.raises(StaleResultsError):
+            missing.clear_overrides(expected_created_at=stored.created_at)
+
+    def test_clear_counts_rows_without_decoding(
+        self, built: UVCache, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_overrides(BATCH, REFIT)
+
+        def no_decode(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("clear_overrides decoded the table")
+
+        monkeypatch.setattr(cache, "_decode_results", no_decode)
+        assert built.clear_overrides() == len(BATCH)
+        assert built.clear_overrides() == 0
+
+
+class TestDropOverridesOnSave:
+    """``save_results(drop_overrides=...)``: overrides a new batch reproduces are dropped."""
+
+    def test_predicate_drops_in_the_same_write(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_overrides(BATCH[:1], REFIT)
+        built.save_overrides(BATCH[1:2], FitOptions(clip_k=3.0))
+        seen: list[tuple[tuple[int, ...], FitOptions]] = []
+
+        def same_as_new(key: ChannelKey, options: FitOptions) -> bool:
+            seen.append((tuple(key), options))
+            return options == FitOptions(clip_k=3.0)
+
+        n = built.save_results(BATCH, FitOptions(clip_k=3.0), drop_overrides=same_as_new)
+        assert n == 1 and len(seen) == 2
+        stored = built.load_results()
+        assert stored is not None and list(stored.overrides) == [BATCH[0].key]
+        assert stored.options == FitOptions(clip_k=3.0)
+        # Nothing matches: the table is copied as it is
+        assert built.save_results(BATCH, FitOptions(), drop_overrides=lambda _k, _o: False) == 0
+        stored = built.load_results()
+        assert stored is not None and list(stored.overrides) == [BATCH[0].key]
+        # Everything matches: no overrides group is left
+        assert built.save_results(BATCH, FitOptions(), drop_overrides=lambda _k, _o: True) == 1
+        with h5py.File(built.path, "r") as h5f:
+            assert "overrides" not in h5f["results/current"]
+
+    def test_discarding_counts_the_overrides(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        assert built.save_results(BATCH, FitOptions()) == 0
+        built.save_overrides(BATCH[:3], REFIT)
+        assert built.save_results(BATCH, FitOptions(), keep_overrides=False) == 3
+        stored = built.load_results()
+        assert stored is not None and stored.overrides == {}
+
+    def test_failing_predicate_keeps_the_previous_results(self, built: UVCache) -> None:
+        built.save_results(BATCH, FitOptions())
+        built.save_overrides(BATCH[:1], REFIT)
+        before = built.load_results()
+
+        def broken(_key: ChannelKey, _options: FitOptions) -> bool:
+            raise RuntimeError("predicate failed")
+
+        with pytest.raises(RuntimeError, match="predicate failed"):
+            built.save_results(BATCH[:2], FitOptions(clip_k=2.0), drop_overrides=broken)
+        assert built.load_results() == before
+        with h5py.File(built.path, "r") as h5f:
+            assert set(h5f["results"]) == {"current"}

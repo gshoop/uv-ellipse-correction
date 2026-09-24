@@ -10,7 +10,7 @@ import numpy as np
 import pyqtgraph as pg
 import pytest
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QPainter, QPalette
+from PyQt6.QtGui import QAction, QColor, QPainter, QPalette
 from PyQt6.QtWidgets import QHeaderView
 from pytestqt.qtbot import QtBot
 
@@ -19,7 +19,7 @@ from uvcorr.channels import electrode_label
 from uvcorr.ellipse import EllipseParams, correct, ellipse_points, fit_ellipse
 from uvcorr.gui import scatter as scatter_module
 from uvcorr.gui._contrast import MIN_TEXT_CONTRAST, contrast_ratio, readable_color
-from uvcorr.gui.controls import ControlBand
+from uvcorr.gui.controls import REFIT_NEEDS_BATCH_TIP, ControlBand
 from uvcorr.gui.inspector import (
     GROUP_FLAGS,
     GROUP_OPTIONS,
@@ -195,6 +195,22 @@ def test_scatter_cap_subsamples_only_kept_points(scatter: ScatterTab) -> None:
     scatter.set_point_cap(1000)  # same subsample again
     again = [item.data["x"] for item in _items(scatter.raw_plot, pg.ScatterPlotItem)]
     assert all(np.array_equal(a, b) for a, b in zip(first, again))
+
+
+def test_scatter_redraws_a_new_mask_of_the_same_channel(scatter: ScatterTab) -> None:
+    """A re-fit changes a channel's kept/rejected split but not its events."""
+    detail = make_detail()
+    scatter.set_detail(detail)
+    n_rej = detail.n_rejected
+    assert n_rej > 0 and scatter.shown_rejected == n_rej
+    assert detail.kept is not None
+    refit = replace(detail, kept=np.ones_like(detail.kept))  # e.g. robust off
+    scatter.set_detail(refit)
+    assert scatter.shown_rejected == 0
+    assert _drawn(scatter.raw_plot) == {"kept": 5000, "rejected": 0}
+    assert "rejected" not in scatter.info_text()
+    scatter.set_detail(detail)  # and back
+    assert scatter.shown_rejected == n_rej
 
 
 def test_scatter_rejected_cap(scatter: ScatterTab, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -405,7 +421,55 @@ def test_band_options(band: ControlBand, qtbot: QtBot) -> None:
     assert not band.clip_spin.isEnabled() and not band.iter_spin.isEnabled()
     band.min_events_spin.setValue(1)
     assert band.options().min_events == 6  # the algebraic fit needs 6 points
-    assert not band.fit_channel_button.isEnabled() and "phase 5" in band.fit_board_button.toolTip()
+    # No batch results yet: the re-fit buttons say why they are disabled
+    assert not band.fit_channel_button.isEnabled() and not band.fit_board_button.isEnabled()
+    assert band.fit_board_button.toolTip() == REFIT_NEEDS_BATCH_TIP
+    band.set_refit_enabled(True, False, REFIT_NEEDS_BATCH_TIP)
+    assert band.fit_channel_button.isEnabled() and "override" in band.fit_channel_button.toolTip()
+    assert band.fit_board_button.toolTip() == REFIT_NEEDS_BATCH_TIP
+
+
+def test_band_keeps_base_values_its_widgets_cannot_show(band: ControlBand) -> None:
+    """An untouched band returns the base exactly (so a re-fit with it reverts to the batch)."""
+    base = FitOptions(clip_k=3.757, min_events=3, max_iter=7)  # e.g. from the CLI
+    band.set_options(base)
+    assert band.clip_spin.value() == pytest.approx(3.76) and band.min_events_spin.value() == 6
+    assert band.options() == base
+    band.robust_check.setChecked(False)  # only the touched field changes
+    assert band.options() == replace(base, robust=False)
+    band.clip_spin.setValue(3.0)
+    assert band.options() == replace(base, robust=False, clip_k=3.0)
+    band.clip_spin.setValue(3.76)  # back to what was shown: the base value again
+    assert band.options().clip_k == 3.757
+    band.set_options(FitOptions(clip_k=3.75))  # two decimals: shown exactly
+    assert band.clip_spin.value() == 3.75 and band.clip_spin.decimals() == 2
+
+
+def test_band_override_status_and_channel_options(band: ControlBand) -> None:
+    override = replace(_result(), options_source="override")
+    band.set_current(override.key, override, 800, override_note="robust off")
+    assert band.label_text().endswith("· override (robust off)")
+    assert not band.use_options_button.isEnabled() and band.channel_options() is None
+    options = FitOptions(robust=False)
+    band.set_channel_options(options, "robust off")
+    assert band.use_options_button.isEnabled() and band.channel_options() == options
+    assert "robust off" in band.use_options_button.toolTip()
+    band.set_channel_options(None)
+    assert not band.use_options_button.isEnabled()
+
+
+def test_band_revert_menu_follows_the_actions(band: ControlBand) -> None:
+    channel_action, board_action = QAction("Channel", band), QAction("Board", band)
+    channel_action.setEnabled(False)
+    board_action.setEnabled(False)
+    band.set_revert_actions(channel_action, board_action)
+    menu = band.revert_button.menu()
+    assert menu is not None and menu.actions() == [channel_action, board_action]
+    assert not band.revert_button.isEnabled()
+    board_action.setEnabled(True)
+    assert band.revert_button.isEnabled()
+    board_action.setEnabled(False)
+    assert not band.revert_button.isEnabled()
 
 
 def test_inspector_columns_fit_the_values(qtbot: QtBot) -> None:

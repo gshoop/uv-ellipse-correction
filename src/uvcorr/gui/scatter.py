@@ -245,6 +245,8 @@ class ScatterTab(QWidget):
         super().__init__(parent)
         self._detail: ChannelDetail | None = None
         self._sample_for: tuple[tuple[int, ...], int, int] | None = None
+        # The kept mask the sample was drawn from (compared by identity)
+        self._sample_mask: npt.NDArray[np.bool_] | None = None
         self._sample: _Sample | None = None
         self._offset: tuple[float, float] | None = None
         self._syncing = False
@@ -451,10 +453,18 @@ class ScatterTab(QWidget):
         self.message_label.setVisible(bool(text))
 
     def _sample_for_detail(self, detail: ChannelDetail) -> _Sample:
-        """The points to draw (cached per channel and cap; deterministic per channel)."""
+        """The points to draw (cached per channel, cap and mask; deterministic per channel).
+
+        The mask is part of the key: a re-fit or a Fit All with other options
+        changes a channel's kept/rejected split but not its events.
+        """
         seed = tuple(int(k) for k in detail.key)
         wanted = (seed, detail.n_events, self.point_cap)
-        if self._sample is not None and self._sample_for == wanted:
+        if (
+            self._sample is not None
+            and self._sample_for == wanted
+            and self._sample_mask is detail.kept
+        ):
             return self._sample
         if detail.kept is None:
             sample = _Sample(
@@ -474,7 +484,7 @@ class ScatterTab(QWidget):
                 n_kept=int(kept.shape[0]),
                 n_rejected=int(rejected.shape[0]),
             )
-        self._sample, self._sample_for = sample, wanted
+        self._sample, self._sample_for, self._sample_mask = sample, wanted, detail.kept
         return sample
 
     def _render(self, autorange: bool) -> None:
